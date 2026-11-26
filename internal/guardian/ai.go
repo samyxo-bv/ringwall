@@ -423,7 +423,10 @@ func (g *Guardian) aggregate(
 
 	disagreement := len(valid) > 1 && minRank != maxRank
 
-	if len(injFlags) > 0 {
+	// Only enforce the automatic prompt-injection freeze/risk floor when a deterministic policy
+	// rule also matched (or deterministic enforcement is already >= freeze), preventing benign
+	// commands like `git commit -m "update system prompt"` from false-freezing.
+	if len(injFlags) > 0 && (len(matches) > 0 || detAction.Rank() >= model.ActionFreeze.Rank()) {
 		if maxRisk < 90 {
 			maxRisk = 90
 		}
@@ -494,7 +497,7 @@ func (g *Guardian) deterministicFallback(
 	}
 
 	rec := detAction
-	if len(injFlags) > 0 {
+	if len(injFlags) > 0 && (len(matches) > 0 || detAction.Rank() >= model.ActionFreeze.Rank()) {
 		if risk < 92 {
 			risk = 92
 		}
