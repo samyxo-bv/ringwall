@@ -26,7 +26,7 @@
 #define ARG_MAX_LEN  128
 #define MAX_ARGS     8
 
-/* Fixed, padding-free 1280-byte event layout shared byte-for-byte with Go userspace. */
+// Fixed, padding-free 1280-byte event layout shared byte-for-byte with Go userspace.
 struct ringwall_event {
     __u32 type;
     __u32 pid;
@@ -43,7 +43,7 @@ struct ringwall_event {
     char  argv[MAX_ARGS][ARG_MAX_LEN];
 };
 
-/* Kernel sys_enter tracepoint ABI layout on 64-bit Linux. */
+// Kernel sys_enter tracepoint ABI layout on 64-bit Linux.
 struct sys_enter_ctx {
     __u64 common;
     long  syscall_nr;
@@ -52,10 +52,10 @@ struct sys_enter_ctx {
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 4 << 20); /* 4 MiB ring buffer */
+    __uint(max_entries, 4 << 20); // 4 MiB ring buffer
 } events SEC(".maps");
 
-/* Index 0 stores ringwalld's own PID so the daemon never self-triggers. */
+// Index 0 stores ringwalld's own PID so the daemon never self-triggers.
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
@@ -63,7 +63,7 @@ struct {
     __type(value, __u32);
 } config_map SEC(".maps");
 
-/* Index 0 counts ringbuf reserve drops per CPU (eliminates silent fail-open under floods). */
+// Index 0 counts ringbuf reserve drops per CPU (eliminates silent fail-open under floods).
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
@@ -76,6 +76,16 @@ static __always_inline void record_drop(void) {
     __u64 *cnt = bpf_map_lookup_elem(&stats_map, &key);
     if (cnt) {
         (*cnt)++;
+    }
+}
+
+static __always_inline void init_event(struct ringwall_event *e) {
+    // Zero fixed 64-byte header (inline-safe for LLVM BPF) and NUL-terminate string buffers.
+    __builtin_memset(e, 0, 64);
+    e->path[0] = '\0';
+    #pragma unroll
+    for (int i = 0; i < MAX_ARGS; i++) {
+        e->argv[i][0] = '\0';
     }
 }
 
@@ -97,24 +107,24 @@ static __always_inline int starts_with_5(const char *s, char a, char b, char c, 
 }
 
 static __always_inline int is_sensitive_etc_read(const char *p) {
-    /* Only emit high-value /etc/ reads (skips /etc/ld.so.cache, /etc/localtime, /etc/hostname flood). */
-    /* /etc/shadow, /etc/ssh/*, /etc/sudoers */
+    // Only emit high-value /etc/ reads (skips /etc/ld.so.cache, /etc/localtime, /etc/hostname flood).
+    // Matches /etc/shadow, /etc/ssh/..., /etc/sudoers
     if (p[5] == 's' && (p[6] == 'h' || p[6] == 's' || p[6] == 'u')) {
         return 1;
     }
-    /* /etc/gshadow */
+    // Matches /etc/gshadow
     if (p[5] == 'g' && p[6] == 's') {
         return 1;
     }
-    /* /etc/ringwall/* */
+    // Matches /etc/ringwall/...
     if (p[5] == 'r' && p[6] == 'i') {
         return 1;
     }
-    /* /etc/cron* */
+    // Matches /etc/cron...
     if (p[5] == 'c' && p[6] == 'r') {
         return 1;
     }
-    /* /etc/./ or /etc// traversal attempts */
+    // Matches /etc/./ or /etc// traversal attempts
     if (p[5] == '.' || p[5] == '/') {
         return 1;
     }
@@ -122,7 +132,7 @@ static __always_inline int is_sensitive_etc_read(const char *p) {
 }
 
 static __always_inline int is_proc_root_traversal(const char *p) {
-    /* Catch /proc/self/root/..., /proc/thread-self/root/..., or /proc/<pid>/root/... */
+    // Catch /proc/self/root/..., /proc/thread-self/root/..., or /proc/<pid>/root/...
     if (p[6] == 's' && p[7] == 'e' && p[8] == 'l' && p[9] == 'f' && p[10] == '/' && p[11] == 'r') {
         return 1;
     }
@@ -144,28 +154,28 @@ static __always_inline int is_interesting_path(const char *p, __u32 flags) {
     if (p[0] == '\0') {
         return 0;
     }
-    /* Relative paths (e.g. 'cd ~/.ssh && cat id_rsa' or openat(dirfd, 'id_rsa')) */
+    // Relative paths (e.g. 'cd ~/.ssh && cat id_rsa' or openat(dirfd, 'id_rsa'))
     if (p[0] != '/') {
         return 1;
     }
-    /* User & root homes + /tmp (symlinks to secrets) */
+    // User & root homes + /tmp (symlinks to secrets)
     if (starts_with_5(p, '/', 'h', 'o', 'm', 'e') ||
         starts_with_5(p, '/', 'r', 'o', 'o', 't') ||
         starts_with_5(p, '/', 't', 'm', 'p', '/')) {
         return 1;
     }
-    /* /etc/ — all writes, or sensitive reads only */
+    // /etc/ — all writes, or sensitive reads only
     if (starts_with_5(p, '/', 'e', 't', 'c', '/')) {
         if (flags & (O_WRONLY | O_RDWR | O_CREAT)) {
             return 1;
         }
         return is_sensitive_etc_read(p);
     }
-    /* /proc/<pid|self>/root/... bypass attempts */
+    // /proc/<pid|self>/root/... bypass attempts
     if (starts_with_5(p, '/', 'p', 'r', 'o', 'c') && p[5] == '/') {
         return is_proc_root_traversal(p);
     }
-    /* Persistence writes to /var, /usr, /boot, /lib, /run/ringwall */
+    // Persistence writes to /var, /usr, /boot, /lib, /run
     if (flags & (O_WRONLY | O_RDWR | O_CREAT)) {
         if (starts_with_5(p, '/', 'v', 'a', 'r', '/') ||
             starts_with_5(p, '/', 'u', 's', 'r', '/') ||
@@ -175,7 +185,7 @@ static __always_inline int is_interesting_path(const char *p, __u32 flags) {
             return 1;
         }
     }
-    /* Reads of /run/ringwall (e.g. token theft probes) */
+    // Reads of /run/ringwall (e.g. token theft probes)
     if (starts_with_5(p, '/', 'r', 'u', 'n', '/') && p[5] == 'r' && p[6] == 'i') {
         return 1;
     }
@@ -208,7 +218,7 @@ static __always_inline int emit_exec(__s32 dirfd, const void *filename, const vo
         return 0;
     }
 
-    __builtin_memset(e, 0, sizeof(*e));
+    init_event(e);
     e->type = EVENT_EXEC;
     e->pid = pid;
     e->dirfd = dirfd;
@@ -235,7 +245,7 @@ static __always_inline int emit_open(__s32 dirfd, const void *filename, __u32 fl
         return 0;
     }
 
-    __builtin_memset(e, 0, sizeof(*e));
+    init_event(e);
     e->flags = flags;
     e->dirfd = dirfd;
     long n = bpf_probe_read_user_str(&e->path, sizeof(e->path), filename);
@@ -287,7 +297,7 @@ static __always_inline int emit_sockaddr(__u32 ev_type, const void *user_addr, l
         return 0;
     }
 
-    __builtin_memset(e, 0, sizeof(*e));
+    init_event(e);
     e->type = ev_type;
     e->pid = pid;
     e->uid = (__u32)bpf_get_current_uid_gid();
