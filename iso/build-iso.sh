@@ -185,8 +185,9 @@ for mp in dev/pts dev proc sys; do
   umount -lf "${CHROOT}/${mp}" || true
 done
 
+# mksquashfs automatically honors the exported SOURCE_DATE_EPOCH for deterministic timestamps.
 mksquashfs "${CHROOT}" "${ISO_ROOT}/live/filesystem.squashfs" \
-  -comp xz -b 1M -no-progress -mkfs-time "${SOURCE_DATE_EPOCH}" -all-time "${SOURCE_DATE_EPOCH}" -e boot
+  -comp xz -b 1M -no-progress -e boot
 
 echo "[6/6] Building hybrid BIOS + UEFI bootable ISO..."
 cat > "${ISO_ROOT}/boot/grub/grub.cfg" <<'EOF'
