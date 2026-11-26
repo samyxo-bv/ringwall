@@ -25,7 +25,7 @@ type Entry struct {
 	Payload   json.RawMessage `json:"payload"`
 }
 
-// Log writes a tamper-evident SHA-256 hash-chained JSONL audit log.
+// Log writes a tamper-evident SHA-256 hash-chained JSONL audit log (mode 0600, root-only).
 type Log struct {
 	mu       sync.Mutex
 	path     string
@@ -34,7 +34,7 @@ type Log struct {
 }
 
 func Open(path string) (*Log, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create audit log dir: %w", err)
 	}
 	l := &Log{
@@ -61,10 +61,10 @@ func (l *Log) Append(kind string, payload any) (Entry, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	l.seq++
+	nextSeq := l.seq + 1
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	e := Entry{
-		Seq:       l.seq,
+		Seq:       nextSeq,
 		Timestamp: now,
 		Kind:      kind,
 		PrevHash:  l.lastHash,
@@ -77,7 +77,7 @@ func (l *Log) Append(kind string, payload any) (Entry, error) {
 		return Entry{}, err
 	}
 
-	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o640)
+	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return Entry{}, fmt.Errorf("open audit log: %w", err)
 	}
@@ -93,6 +93,8 @@ func (l *Log) Append(kind string, payload any) (Entry, error) {
 		return Entry{}, err
 	}
 
+	// Only advance sequence & chain tip after durable write + fsync succeeded.
+	l.seq = nextSeq
 	l.lastHash = e.Hash
 	return e, nil
 }

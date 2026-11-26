@@ -100,7 +100,7 @@ func main() {
 		fmt.Printf("  Mode:       %s\n", st.Mode)
 		fmt.Printf("  Sensor:     %s\n", st.SensorMode)
 		fmt.Printf("  Policies:   %d\n", st.PolicyCount)
-		fmt.Printf("  Events:     %d\n", st.EventsTotal)
+		fmt.Printf("  Events:     %d (dropped: %d)\n", st.EventsTotal, st.DroppedEvents)
 		fmt.Printf("  Incidents:  %d (frozen: %d)\n", st.IncidentsTotal, st.FrozenCount)
 		fmt.Printf("  AI Pool:    enabled=%v strategy=%s models=%v\n", st.AIEnabled, st.AIStrategy, st.AIModels)
 		fmt.Printf("  Audit Log:  %s\n", st.AuditLogPath)
@@ -281,7 +281,10 @@ func runSetupWizard(cfgPath string) {
 	modelID := ask("Model ID", defaultModel)
 	apiKey := ""
 	if prov.NeedsAPIKey || prov.ID == "openai" {
-		apiKey = ask("API Key (stored in 0600 key file, leave blank if local/no auth)", "")
+		if prov.Kind == "cloud" {
+			fmt.Println("  [Privacy note] Cloud AI APIs receive redacted incident metadata (command lines with common tokens/keys stripped). For 100% offline privacy, use Local Ollama.")
+		}
+		apiKey = readSecretPrompt(in, "API Key (input hidden if TTY, stored in 0600 key file; blank if local)")
 	}
 
 	fmt.Println("\n--- Step 3: Live 4-Point Security & Refusal Check ---")

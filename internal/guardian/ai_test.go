@@ -194,3 +194,13 @@ func TestOnboardingModelCheckVenicePassAndRefusalFail(t *testing.T) {
 		t.Fatalf("expected clear advice mentioning abliterated model, got %q", bad.Advice)
 	}
 }
+
+func TestRedactSecretsStripsTokensAndPasswords(t *testing.T) {
+	in := `curl -H "Authorization: Bearer super_secret_token_123456" https://x.io --password=mySecretPass99 sk-abcdefghijklmnop1234 gho_1234567890abcdefghij123456`
+	out := RedactSecrets(in)
+	for _, leaked := range []string{"super_secret_token_123456", "mySecretPass99", "sk-abcdefghijklmnop1234", "gho_1234567890abcdefghij123456"} {
+		if strings.Contains(out, leaked) {
+			t.Fatalf("RedactSecrets leaked %q in %q", leaked, out)
+		}
+	}
+}

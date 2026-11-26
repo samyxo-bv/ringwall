@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Ringwall Linux eBPF tracepoint sensor.
-// Traces execve, sensitive openat, and IPv4/IPv6 connect syscalls and emits
-// compact fixed-layout events to a BPF ring buffer for userspace evaluation.
+// Traces execve, execveat, openat, openat2, open (x86_64), connect, and sendto.
+// Uses a 4 MiB ring buffer plus a per-CPU drop counter so ringbuf pressure is never silent.
 
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
@@ -10,9 +10,12 @@
 #define EVENT_EXEC    1
 #define EVENT_OPENAT  2
 #define EVENT_CONNECT 3
+#define EVENT_SENDTO  4
 
 #define AF_INET  2
 #define AF_INET6 10
+
+#define AT_FDCWD (-100)
 
 #define O_WRONLY 0x0001
 #define O_RDWR   0x0002
@@ -20,18 +23,20 @@
 
 #define PATH_MAX_LEN 192
 #define COMM_MAX_LEN 16
-#define ARG_MAX_LEN  64
-#define MAX_ARGS     4
+#define ARG_MAX_LEN  128
+#define MAX_ARGS     8
 
-/* Fixed, padding-free 504-byte event layout shared with Go userspace. */
+/* Fixed, padding-free 1280-byte event layout shared byte-for-byte with Go userspace. */
 struct ringwall_event {
     __u32 type;
     __u32 pid;
     __u32 ppid;
     __u32 uid;
     __u32 flags;
+    __s32 dirfd;
     __u16 dport;
     __u16 family;
+    __u32 _pad;
     __u8  addr[16];
     char  comm[COMM_MAX_LEN];
     char  path[PATH_MAX_LEN];
@@ -47,7 +52,7 @@ struct sys_enter_ctx {
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 20); /* 1 MiB ring buffer */
+    __uint(max_entries, 4 << 20); /* 4 MiB ring buffer */
 } events SEC(".maps");
 
 /* Index 0 stores ringwalld's own PID so the daemon never self-triggers. */
@@ -57,6 +62,22 @@ struct {
     __type(key, __u32);
     __type(value, __u32);
 } config_map SEC(".maps");
+
+/* Index 0 counts ringbuf reserve drops per CPU (eliminates silent fail-open under floods). */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} stats_map SEC(".maps");
+
+static __always_inline void record_drop(void) {
+    __u32 key = 0;
+    __u64 *cnt = bpf_map_lookup_elem(&stats_map, &key);
+    if (cnt) {
+        (*cnt)++;
+    }
+}
 
 static __always_inline int is_self_pid(__u32 pid) {
     __u32 key = 0;
@@ -75,29 +96,107 @@ static __always_inline int starts_with_5(const char *s, char a, char b, char c, 
     return s[0] == a && s[1] == b && s[2] == c && s[3] == d && s[4] == e;
 }
 
-static __always_inline int is_interesting_path(const char *p, __u32 flags) {
-    if (starts_with_5(p, '/', 'e', 't', 'c', '/')) {
+static __always_inline int is_sensitive_etc_read(const char *p) {
+    /* Only emit high-value /etc/ reads (skips /etc/ld.so.cache, /etc/localtime, /etc/hostname flood). */
+    /* /etc/shadow, /etc/ssh/*, /etc/sudoers */
+    if (p[5] == 's' && (p[6] == 'h' || p[6] == 's' || p[6] == 'u')) {
         return 1;
     }
-    if (starts_with_5(p, '/', 'h', 'o', 'm', 'e') || starts_with_5(p, '/', 'r', 'o', 'o', 't')) {
+    /* /etc/gshadow */
+    if (p[5] == 'g' && p[6] == 's') {
         return 1;
     }
-    if (flags & (O_WRONLY | O_RDWR | O_CREAT)) {
-        if (starts_with_5(p, '/', 'v', 'a', 'r', '/') ||
-            starts_with_5(p, '/', 'u', 's', 'r', '/') ||
-            starts_with_5(p, '/', 'b', 'o', 'o', 't') ||
-            starts_with_4(p, '/', 'l', 'i', 'b')) {
-            return 1;
-        }
+    /* /etc/ringwall/* */
+    if (p[5] == 'r' && p[6] == 'i') {
+        return 1;
     }
-    if (p[0] == '.') {
+    /* /etc/cron* */
+    if (p[5] == 'c' && p[6] == 'r') {
+        return 1;
+    }
+    /* /etc/./ or /etc// traversal attempts */
+    if (p[5] == '.' || p[5] == '/') {
         return 1;
     }
     return 0;
 }
 
-SEC("tracepoint/syscalls/sys_enter_execve")
-int trace_execve(struct sys_enter_ctx *ctx) {
+static __always_inline int is_proc_root_traversal(const char *p) {
+    /* Catch /proc/self/root/..., /proc/thread-self/root/..., or /proc/<pid>/root/... */
+    if (p[6] == 's' && p[7] == 'e' && p[8] == 'l' && p[9] == 'f' && p[10] == '/' && p[11] == 'r') {
+        return 1;
+    }
+    if (p[6] == 't' && p[7] == 'h') {
+        return 1;
+    }
+    if (p[6] >= '0' && p[6] <= '9') {
+        #pragma unroll
+        for (int i = 7; i < 16; i++) {
+            if (p[i] == '/' && p[i + 1] == 'r' && p[i + 2] == 'o' && p[i + 3] == 'o' && p[i + 4] == 't') {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static __always_inline int is_interesting_path(const char *p, __u32 flags) {
+    if (p[0] == '\0') {
+        return 0;
+    }
+    /* Relative paths (e.g. 'cd ~/.ssh && cat id_rsa' or openat(dirfd, 'id_rsa')) */
+    if (p[0] != '/') {
+        return 1;
+    }
+    /* User & root homes + /tmp (symlinks to secrets) */
+    if (starts_with_5(p, '/', 'h', 'o', 'm', 'e') ||
+        starts_with_5(p, '/', 'r', 'o', 'o', 't') ||
+        starts_with_5(p, '/', 't', 'm', 'p', '/')) {
+        return 1;
+    }
+    /* /etc/ — all writes, or sensitive reads only */
+    if (starts_with_5(p, '/', 'e', 't', 'c', '/')) {
+        if (flags & (O_WRONLY | O_RDWR | O_CREAT)) {
+            return 1;
+        }
+        return is_sensitive_etc_read(p);
+    }
+    /* /proc/<pid|self>/root/... bypass attempts */
+    if (starts_with_5(p, '/', 'p', 'r', 'o', 'c') && p[5] == '/') {
+        return is_proc_root_traversal(p);
+    }
+    /* Persistence writes to /var, /usr, /boot, /lib, /run/ringwall */
+    if (flags & (O_WRONLY | O_RDWR | O_CREAT)) {
+        if (starts_with_5(p, '/', 'v', 'a', 'r', '/') ||
+            starts_with_5(p, '/', 'u', 's', 'r', '/') ||
+            starts_with_5(p, '/', 'b', 'o', 'o', 't') ||
+            starts_with_4(p, '/', 'l', 'i', 'b') ||
+            starts_with_5(p, '/', 'r', 'u', 'n', '/')) {
+            return 1;
+        }
+    }
+    /* Reads of /run/ringwall (e.g. token theft probes) */
+    if (starts_with_5(p, '/', 'r', 'u', 'n', '/') && p[5] == 'r' && p[6] == 'i') {
+        return 1;
+    }
+    return 0;
+}
+
+static __always_inline void read_exec_argv(struct ringwall_event *e, const char *const *argv) {
+    if (!argv) {
+        return;
+    }
+    #pragma unroll
+    for (int i = 0; i < MAX_ARGS; i++) {
+        const char *argp = 0;
+        if (bpf_probe_read_user(&argp, sizeof(argp), &argv[i]) != 0 || !argp) {
+            break;
+        }
+        bpf_probe_read_user_str(e->argv[i], ARG_MAX_LEN, argp);
+    }
+}
+
+static __always_inline int emit_exec(__s32 dirfd, const void *filename, const void *argv_ptr) {
     __u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
     if (is_self_pid(pid)) {
         return 0;
@@ -105,42 +204,26 @@ int trace_execve(struct sys_enter_ctx *ctx) {
 
     struct ringwall_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) {
+        record_drop();
         return 0;
     }
 
     __builtin_memset(e, 0, sizeof(*e));
     e->type = EVENT_EXEC;
     e->pid = pid;
+    e->dirfd = dirfd;
     e->uid = (__u32)bpf_get_current_uid_gid();
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
-    bpf_probe_read_user_str(&e->path, sizeof(e->path), (const void *)ctx->args[0]);
-
-    const char *const *argv = (const char *const *)ctx->args[1];
-    if (argv) {
-        const char *argp = 0;
-        if (bpf_probe_read_user(&argp, sizeof(argp), &argv[0]) == 0 && argp) {
-            bpf_probe_read_user_str(e->argv[0], ARG_MAX_LEN, argp);
-        }
-        argp = 0;
-        if (bpf_probe_read_user(&argp, sizeof(argp), &argv[1]) == 0 && argp) {
-            bpf_probe_read_user_str(e->argv[1], ARG_MAX_LEN, argp);
-        }
-        argp = 0;
-        if (bpf_probe_read_user(&argp, sizeof(argp), &argv[2]) == 0 && argp) {
-            bpf_probe_read_user_str(e->argv[2], ARG_MAX_LEN, argp);
-        }
-        argp = 0;
-        if (bpf_probe_read_user(&argp, sizeof(argp), &argv[3]) == 0 && argp) {
-            bpf_probe_read_user_str(e->argv[3], ARG_MAX_LEN, argp);
-        }
+    if (filename) {
+        bpf_probe_read_user_str(&e->path, sizeof(e->path), filename);
     }
+    read_exec_argv(e, (const char *const *)argv_ptr);
 
     bpf_ringbuf_submit(e, 0);
     return 0;
 }
 
-SEC("tracepoint/syscalls/sys_enter_openat")
-int trace_openat(struct sys_enter_ctx *ctx) {
+static __always_inline int emit_open(__s32 dirfd, const void *filename, __u32 flags) {
     __u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
     if (is_self_pid(pid)) {
         return 0;
@@ -148,13 +231,15 @@ int trace_openat(struct sys_enter_ctx *ctx) {
 
     struct ringwall_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) {
+        record_drop();
         return 0;
     }
 
     __builtin_memset(e, 0, sizeof(*e));
-    e->flags = (__u32)ctx->args[2];
-    long n = bpf_probe_read_user_str(&e->path, sizeof(e->path), (const void *)ctx->args[1]);
-    if (n <= 1 || !is_interesting_path(e->path, e->flags)) {
+    e->flags = flags;
+    e->dirfd = dirfd;
+    long n = bpf_probe_read_user_str(&e->path, sizeof(e->path), filename);
+    if (n <= 1 || !is_interesting_path(e->path, flags)) {
         bpf_ringbuf_discard(e, 0);
         return 0;
     }
@@ -168,15 +253,11 @@ int trace_openat(struct sys_enter_ctx *ctx) {
     return 0;
 }
 
-SEC("tracepoint/syscalls/sys_enter_connect")
-int trace_connect(struct sys_enter_ctx *ctx) {
+static __always_inline int emit_sockaddr(__u32 ev_type, const void *user_addr, long addrlen) {
     __u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
     if (is_self_pid(pid)) {
         return 0;
     }
-
-    const void *user_addr = (const void *)ctx->args[1];
-    long addrlen = (long)ctx->args[2];
     if (!user_addr || addrlen < 16) {
         return 0;
     }
@@ -202,11 +283,12 @@ int trace_connect(struct sys_enter_ctx *ctx) {
 
     struct ringwall_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) {
+        record_drop();
         return 0;
     }
 
     __builtin_memset(e, 0, sizeof(*e));
-    e->type = EVENT_CONNECT;
+    e->type = ev_type;
     e->pid = pid;
     e->uid = (__u32)bpf_get_current_uid_gid();
     e->family = family;
@@ -221,6 +303,46 @@ int trace_connect(struct sys_enter_ctx *ctx) {
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
     bpf_ringbuf_submit(e, 0);
     return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_execve")
+int trace_execve(struct sys_enter_ctx *ctx) {
+    return emit_exec(AT_FDCWD, (const void *)ctx->args[0], (const void *)ctx->args[1]);
+}
+
+SEC("tracepoint/syscalls/sys_enter_execveat")
+int trace_execveat(struct sys_enter_ctx *ctx) {
+    return emit_exec((__s32)ctx->args[0], (const void *)ctx->args[1], (const void *)ctx->args[2]);
+}
+
+SEC("tracepoint/syscalls/sys_enter_openat")
+int trace_openat(struct sys_enter_ctx *ctx) {
+    return emit_open((__s32)ctx->args[0], (const void *)ctx->args[1], (__u32)ctx->args[2]);
+}
+
+SEC("tracepoint/syscalls/sys_enter_openat2")
+int trace_openat2(struct sys_enter_ctx *ctx) {
+    __u64 how_flags = 0;
+    const void *how = (const void *)ctx->args[2];
+    if (how) {
+        bpf_probe_read_user(&how_flags, sizeof(how_flags), how);
+    }
+    return emit_open((__s32)ctx->args[0], (const void *)ctx->args[1], (__u32)how_flags);
+}
+
+SEC("tracepoint/syscalls/sys_enter_open")
+int trace_open(struct sys_enter_ctx *ctx) {
+    return emit_open(AT_FDCWD, (const void *)ctx->args[0], (__u32)ctx->args[1]);
+}
+
+SEC("tracepoint/syscalls/sys_enter_connect")
+int trace_connect(struct sys_enter_ctx *ctx) {
+    return emit_sockaddr(EVENT_CONNECT, (const void *)ctx->args[1], (long)ctx->args[2]);
+}
+
+SEC("tracepoint/syscalls/sys_enter_sendto")
+int trace_sendto(struct sys_enter_ctx *ctx) {
+    return emit_sockaddr(EVENT_SENDTO, (const void *)ctx->args[4], (long)ctx->args[5]);
 }
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";

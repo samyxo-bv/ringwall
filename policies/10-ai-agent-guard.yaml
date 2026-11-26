@@ -3,12 +3,12 @@
 # from reading host secrets, exfiltrating credentials, or executing destructive wipe loops.
 rules:
   - id: RW-AGENT-001
-    name: AI agent or script accessing SSH private keys
+    name: Non-SSH binary accessing SSH private keys
     category: ai-agent-guard
     severity: critical
     action: freeze
     mitre: T1552.004
-    description: Detects AI agent process trees or scripted runtimes reading SSH private key material.
+    description: Detects scripts, AI agents, or unknown binaries opening SSH private keys (paths canonicalized across cwd, dirfd, /proc/self/root, and symlinks).
     match:
       event_types: [open]
       path_globs:
@@ -17,14 +17,14 @@ rules:
         - '**/.ssh/*.key'
       exclude_path_globs:
         - '**/.ssh/*.pub'
-      exclude_comm:
-        - ssh
-        - ssh-agent
-        - ssh-add
-        - ssh-keygen
-        - scp
-        - sftp
-        - git
+      exclude_exe_paths:
+        - '/usr/bin/ssh'
+        - '/usr/bin/ssh-agent'
+        - '/usr/bin/ssh-add'
+        - '/usr/bin/ssh-keygen'
+        - '/usr/bin/scp'
+        - '/usr/bin/sftp'
+        - '/usr/bin/git'
 
   - id: RW-AGENT-002
     name: AI agent accessing cloud, Kubernetes, or GPG credentials
@@ -32,7 +32,7 @@ rules:
     severity: critical
     action: freeze
     mitre: T1552.001
-    description: Blocks autonomous agents from reading AWS, GCP, Kubernetes, Docker, or GPG credential stores.
+    description: Flags autonomous agent process trees reading AWS, GCP, Kubernetes, Docker, or GPG credential stores.
     match:
       event_types: [open]
       path_globs:
@@ -52,24 +52,23 @@ rules:
         - agent
 
   - id: RW-AGENT-003
-    name: Destructive filesystem wipe (rm -rf root/home)
+    name: Destructive filesystem wipe (rm recursive + force on system/home root)
     category: ai-agent-guard
     severity: critical
     action: kill
     mitre: T1485
-    description: Halts runaway destructive commands targeting /, /etc, /usr, /var, or home directories.
+    description: Tokenized argv matcher catching recursive-force rm targeting /, /etc, /usr, /var, /home, /root, or ~ regardless of flag ordering, -Rf, --, or /bin/rm.
     match:
       event_types: [exec]
-      cmdline_regex:
-        - '(^|\s)rm\s+.*(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r|--recursive\s+--force)\s+(/(\s|$)|/\*|/etc|/usr|/var|/home|~|\$HOME)'
+      destructive_rm: true
 
   - id: RW-AGENT-004
-    name: Encoded payload execution by agent or interpreter
+    name: Encoded payload execution (shell wrapper)
     category: ai-agent-guard
     severity: high
     action: freeze
     mitre: T1027
-    description: Flags base64-decoded execution pipelines commonly used in prompt-injection payloads.
+    description: Flags shell -c commands executing base64-decoded payload pipelines.
     match:
       event_types: [exec]
       cmdline_regex:

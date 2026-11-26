@@ -13,9 +13,9 @@ jobs:
     name: Build, Verify in QEMU & Publish Release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: "1.24"
 
@@ -28,11 +28,11 @@ jobs:
             grub-pc-bin grub-efi-amd64-bin mtools dosfstools \
             qemu-system-x86 python3
 
-      - name: Build eBPF + Go binaries & run race tests
+      - name: Verify modules, build eBPF + Go binaries & run race tests
         run: |
-          go mod tidy
+          go mod verify
           make bpf
-          go test -race ./...
+          go test -mod=readonly -race ./...
           VERSION="${GITHUB_REF_NAME}" make build
 
       - name: Package Linux tarball
@@ -55,7 +55,7 @@ jobs:
           sha256sum "ringwall-${GITHUB_REF_NAME}-linux-amd64.tar.gz" "ringwall-${GITHUB_REF_NAME}-appliance-amd64.iso" > SHA256SUMS.txt
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b85266b0e65 # v2
         with:
           generate_release_notes: true
           files: |

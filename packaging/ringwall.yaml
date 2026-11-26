@@ -20,7 +20,7 @@ sensor:
 
 enforcer:
   enable_signals: true
-  enable_nftables: true
+  enable_nftables: false # Set true after loading packaging/nftables.conf (enabled automatically in the Ringwall ISO)
   nft_table: inet ringwall
   dry_run: false
 

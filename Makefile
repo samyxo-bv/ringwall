@@ -5,7 +5,7 @@ BPF_CLANG ?= clang
 BPF_ARCH ?= $(shell uname -m | sed 's/x86_64/x86/;s/aarch64/arm64/')
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: all bpf build build-noebpf test vet lint clean iso test-iso
+.PHONY: all bpf build build-noebpf test vet clean iso test-iso
 
 all: build
 
@@ -16,19 +16,19 @@ bpf:
 
 build: bpf
 	mkdir -p bin
-	CGO_ENABLED=0 GOOS=linux GOARCH=$(ARCH) go build -tags ebpf_embed -ldflags "$(LDFLAGS)" -o bin/ringwalld ./cmd/ringwalld
-	CGO_ENABLED=0 GOOS=linux GOARCH=$(ARCH) go build -ldflags "$(LDFLAGS)" -o bin/ringwallctl ./cmd/ringwallctl
+	CGO_ENABLED=0 GOOS=linux GOARCH=$(ARCH) go build -mod=readonly -tags ebpf_embed -ldflags "$(LDFLAGS)" -o bin/ringwalld ./cmd/ringwalld
+	CGO_ENABLED=0 GOOS=linux GOARCH=$(ARCH) go build -mod=readonly -ldflags "$(LDFLAGS)" -o bin/ringwallctl ./cmd/ringwallctl
 
 build-noebpf:
 	mkdir -p bin
-	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o bin/ringwalld ./cmd/ringwalld
-	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o bin/ringwallctl ./cmd/ringwallctl
+	CGO_ENABLED=0 go build -mod=readonly -ldflags "$(LDFLAGS)" -o bin/ringwalld ./cmd/ringwalld
+	CGO_ENABLED=0 go build -mod=readonly -ldflags "$(LDFLAGS)" -o bin/ringwallctl ./cmd/ringwallctl
 
 test:
-	go test -race -v ./...
+	go test -mod=readonly -race -v ./...
 
 vet:
-	go vet ./...
+	go vet -mod=readonly ./...
 
 iso: build
 	sudo ./iso/build-iso.sh

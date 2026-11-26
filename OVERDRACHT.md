@@ -1,14 +1,13 @@
 # Ringwall: Handover
 
-## Current Status (2026-11-26)
+## Current Status (2026-11-27)
 
 - **Repository:** `https://github.com/samyxo-bv/ringwall` (public, Apache-2.0).
-- **Live / Released:** Initial v0.1.0 build in progress.
-- **Open:** Complete Go daemon (`ringwalld`), CLI (`ringwallctl`), eBPF CO-RE sensor, policy packs, local AI Guardian, web dashboard, immutable ISO pipeline, GitHub Actions CI + QEMU live boot/attack test, independent Claude Opus security review, and `v0.1.0` release.
-- **Next step:** Finish v0.1.0 implementation, verify green CI (Go tests + eBPF build + ISO build + QEMU live attack E2E), pass independent security review, and tag `v0.1.0`.
+- **Branch / PR:** `feat/v0.1-mvp` (PR #1) — all P0-1, P1-1..P1-7, and key P2 findings from independent Claude Opus 5.5 security review (`thr_p8xe9zd4tv`) have been remediated.
+- **Open:** Verify green CI (eBPF + `go test -mod=readonly -race` + live root host test + 8 live QEMU ISO assertions), run Claude Opus 5.5 re-review on new HEAD, merge PR #1, and tag `v0.1.0` release with verified `.iso`.
 
-## Key Decisions
+## Key Architecture Decisions
 
-- **Architecture:** Deterministic policy engine + kernel enforcement is the hard security wall; local AI Guardian explains, scores, and can escalate only — never downgrade a deterministic deny/freeze/kill verdict.
-- **CI Runner:** Public repo uses GitHub-hosted `ubuntu-latest` (unlimited free minutes, avoids exposing private self-hosted runners to untrusted public PRs).
-- **Zero-secret public repo:** Keep all docs, configs, and scripts free of internal infrastructure details.
+- **Strict privilege separation:** `/run/ringwall/api.token` and `/var/log/ringwall/audit.jsonl` are strictly `0600 root:root`. Monitored unprivileged users (`operator` in ISO, password locked, no sudo) cannot read the token or disable enforcement. Strictly non-sensitive health metrics are exposed read-only in `/run/ringwall-status/status.json`.
+- **Deterministic wall first, AI second:** eBPF tracepoints (`execve`, `execveat`, `openat`, `openat2`, `open`, `connect`, `sendto`) + canonical path resolution + `pidfd`-verified `SIGSTOP`/`SIGKILL` & cgroup v2 freezer run first; multi-model uncensored AI Guardian explains/escalates only and can never downgrade a deterministic verdict.
+- **CI runner isolation:** Public repo uses GitHub-hosted `ubuntu-latest` with SHA-pinned GitHub Actions.

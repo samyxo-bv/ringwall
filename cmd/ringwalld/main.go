@@ -82,6 +82,11 @@ func main() {
 
 	d := daemon.New(version, cfg, sens, lin, pol, enf, guard, alog)
 	d.SetStoragePaths(*cfgPath, filepath.Join(filepath.Dir(*cfgPath), "keys"))
+	if _, err := os.Stat("/run"); err == nil {
+		_ = os.MkdirAll("/run/ringwall-status", 0o755)
+		_ = os.Chmod("/run/ringwall-status", 0o755)
+		d.SetPublicStatusPath("/run/ringwall-status/status.json")
+	}
 
 	srv, err := api.NewServer(d, cfg.API)
 	if err != nil {

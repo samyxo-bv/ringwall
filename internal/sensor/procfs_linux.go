@@ -10,16 +10,17 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/samyxo-bv/ringwall/internal/config"
 	"github.com/samyxo-bv/ringwall/internal/model"
 )
 
-// procfsSensor is an automatic unprivileged fallback when CAP_BPF is unavailable.
 type procfsSensor struct {
 	interval time.Duration
 	selfPID  int
+	drops    atomic.Uint64
 }
 
 func newProcfsSensor(cfg config.SensorConfig) (Sensor, error) {
@@ -36,11 +37,11 @@ func newProcfsSensor(cfg config.SensorConfig) (Sensor, error) {
 	}, nil
 }
 
-func (p *procfsSensor) Mode() string { return "procfs-fallback" }
+func (p *procfsSensor) Mode() string    { return "procfs-fallback" }
+func (p *procfsSensor) Dropped() uint64 { return p.drops.Load() }
 
 func (p *procfsSensor) Start(ctx context.Context, out chan<- model.Event) error {
 	seen := make(map[int]string, 256)
-	// Seed existing processes so startup doesn't flood alerts on preexisting daemons.
 	p.scan(seen, nil)
 
 	ticker := time.NewTicker(p.interval)
@@ -104,10 +105,12 @@ func (p *procfsSensor) scan(seen map[int]string, out chan<- model.Event) {
 			Exe:       exe,
 			Path:      exe,
 			Cmdline:   cmdline,
+			Argv:      args,
 		}
 		select {
 		case out <- ev:
 		default:
+			p.drops.Add(1)
 		}
 	}
 	for pid := range seen {

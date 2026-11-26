@@ -36,10 +36,11 @@ type Rule struct {
 type MatchSpec struct {
 	EventTypes       []model.EventType `yaml:"event_types,omitempty"`
 	CommIn           []string          `yaml:"comm_in,omitempty"`
-	ExcludeComm      []string          `yaml:"exclude_comm,omitempty"`
+	ExcludeExePaths  []string          `yaml:"exclude_exe_paths,omitempty"`
 	PathGlobs        []string          `yaml:"path_globs,omitempty"`
 	ExcludePathGlobs []string          `yaml:"exclude_path_globs,omitempty"`
 	CmdlineRegex     []string          `yaml:"cmdline_regex,omitempty"`
+	DestructiveRM    bool              `yaml:"destructive_rm,omitempty"`
 	AncestorAny      []string          `yaml:"ancestor_any,omitempty"`
 	RequireWrite     bool              `yaml:"require_write,omitempty"`
 	DstPorts         []uint16          `yaml:"dst_ports,omitempty"`
@@ -48,7 +49,7 @@ type MatchSpec struct {
 
 type allowEntry struct {
 	ruleID string
-	comm   string
+	exe    string
 	path   string
 }
 
@@ -126,39 +127,44 @@ func (e *Engine) Count() int {
 	return len(e.rules)
 }
 
-// AddRuntimeAllow adds a strictly scoped operator exception for a specific (ruleID, comm, path) tuple.
-func (e *Engine) AddRuntimeAllow(ruleID, comm, path string) {
-	if ruleID == "" || (comm == "" && path == "") {
+// AddRuntimeAllow adds a strictly scoped exception bound to full canonical exe path + target path.
+func (e *Engine) AddRuntimeAllow(ruleID, exe, path string) {
+	if ruleID == "" || exe == "" || path == "" {
 		return
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.runtimeAllow = append(e.runtimeAllow, allowEntry{
 		ruleID: ruleID,
-		comm:   strings.ToLower(comm),
-		path:   path,
+		exe:    cleanSlash(exe),
+		path:   cleanSlash(path),
 	})
 }
 
 func (e *Engine) isRuntimeAllowed(ruleID string, ev model.Event) bool {
-	comm := strings.ToLower(ev.Comm)
+	if ev.Exe == "" || ev.Path == "" {
+		return false
+	}
+	exe := cleanSlash(ev.Exe)
+	p := cleanSlash(ev.Path)
 	for _, a := range e.runtimeAllow {
-		if a.ruleID != ruleID {
-			continue
+		if a.ruleID == ruleID && a.exe == exe && a.path == p {
+			return true
 		}
-		if a.comm != "" && a.comm != comm {
-			continue
-		}
-		if a.path != "" && a.path != ev.Path {
-			continue
-		}
-		return true
 	}
 	return false
 }
 
 // Evaluate checks an event against all deterministic policies.
 func (e *Engine) Evaluate(ev model.Event) ([]model.PolicyMatch, model.Action, model.Severity) {
+	// Normalize paths defensively even if Evaluate is called directly without lineage.Enrich.
+	if ev.Path != "" {
+		ev.Path = cleanSlash(ev.Path)
+	}
+	if ev.Exe != "" {
+		ev.Exe = cleanSlash(ev.Exe)
+	}
+
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
@@ -208,15 +214,18 @@ func matchesRule(r *Rule, ev model.Event) bool {
 		}
 	}
 
-	commLower := strings.ToLower(ev.Comm)
-	exeBase := strings.ToLower(filepath.Base(ev.Exe))
-
-	for _, ex := range m.ExcludeComm {
-		exL := strings.ToLower(ex)
-		if commLower == exL || exeBase == exL {
-			return false
+	// Security invariant: exclusions ONLY match exact canonical full executable paths
+	// (never attacker-controllable comm / PR_SET_NAME or basename like /tmp/ssh).
+	if len(m.ExcludeExePaths) > 0 && ev.Exe != "" {
+		for _, allowedExe := range m.ExcludeExePaths {
+			if ev.Exe == cleanSlash(allowedExe) {
+				return false
+			}
 		}
 	}
+
+	commLower := strings.ToLower(ev.Comm)
+	exeBase := strings.ToLower(filepath.Base(ev.Exe))
 
 	if len(m.CommIn) > 0 {
 		ok := false
@@ -251,6 +260,12 @@ func matchesRule(r *Rule, ev model.Event) bool {
 			}
 		}
 		if !ok {
+			return false
+		}
+	}
+
+	if m.DestructiveRM {
+		if !IsDestructiveRM(ev) {
 			return false
 		}
 	}
@@ -300,6 +315,99 @@ func matchesRule(r *Rule, ev model.Event) bool {
 	return true
 }
 
+// IsDestructiveRM parses tokenized argv (from eBPF or cmdline) to detect recursive-force rm
+// targeting critical system or home roots regardless of flag ordering, case (-Rf), --, or /bin/rm.
+func IsDestructiveRM(ev model.Event) bool {
+	tokens := ev.Argv
+	if len(tokens) == 0 && ev.Cmdline != "" {
+		tokens = strings.Fields(ev.Cmdline)
+	}
+	if len(tokens) == 0 {
+		return false
+	}
+
+	// Check both direct rm exec and shell wrapper 'sh -c "rm ..."'
+	if checkRMTokens(tokens, ev.Exe) {
+		return true
+	}
+	for i := 0; i < len(tokens)-1; i++ {
+		if tokens[i] == "-c" || tokens[i] == "-lc" {
+			sub := strings.Fields(tokens[i+1])
+			if checkRMTokens(sub, "") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func checkRMTokens(tokens []string, exe string) bool {
+	if len(tokens) < 2 {
+		return false
+	}
+	prog := strings.ToLower(filepath.Base(filepath.ToSlash(tokens[0])))
+	exeBase := strings.ToLower(filepath.Base(filepath.ToSlash(exe)))
+	if prog != "rm" && exeBase != "rm" {
+		return false
+	}
+
+	recursive := false
+	force := false
+	endOfOpts := false
+	var targets []string
+
+	for _, tok := range tokens[1:] {
+		if tok == "#" || strings.HasPrefix(tok, "#") {
+			break
+		}
+		if !endOfOpts && tok == "--" {
+			endOfOpts = true
+			continue
+		}
+		if !endOfOpts && strings.HasPrefix(tok, "--") {
+			switch tok {
+			case "--recursive":
+				recursive = true
+			case "--force":
+				force = true
+			}
+			continue
+		}
+		if !endOfOpts && strings.HasPrefix(tok, "-") && len(tok) > 1 {
+			for _, ch := range tok[1:] {
+				switch ch {
+				case 'r', 'R':
+					recursive = true
+				case 'f':
+					force = true
+				}
+			}
+			continue
+		}
+		targets = append(targets, tok)
+	}
+
+	if !recursive || !force {
+		return false
+	}
+
+	dangerous := map[string]bool{
+		"/": true, "/*": true, "/etc": true, "/usr": true, "/var": true,
+		"/bin": true, "/sbin": true, "/lib": true, "/boot": true,
+		"/home": true, "/root": true, "~": true, "~/*": true, "$HOME": true, "${HOME}": true,
+	}
+	for _, t := range targets {
+		raw := strings.TrimSpace(t)
+		if dangerous[raw] || dangerous[cleanSlash(raw)] {
+			return true
+		}
+		if strings.HasPrefix(raw, "/etc/") && strings.Count(cleanSlash(raw), "/") <= 1 {
+			return true
+		}
+	}
+	return false
+}
+
 func matchesAnyAncestor(needles []string, ev model.Event) bool {
 	check := func(comm, exe, cmdline string) bool {
 		cL := strings.ToLower(comm)
@@ -333,7 +441,35 @@ func isPublicIP(ipStr string) bool {
 	return true
 }
 
-// matchGlob supports ** (any path segments), * (any chars except '/'), and ? (single char).
+func cleanSlash(p string) string {
+	p = filepath.ToSlash(p)
+	isAbs := strings.HasPrefix(p, "/")
+	parts := strings.Split(p, "/")
+	stack := make([]string, 0, len(parts))
+	for _, seg := range parts {
+		switch seg {
+		case "", ".":
+			continue
+		case "..":
+			if len(stack) > 0 && stack[len(stack)-1] != ".." {
+				stack = stack[:len(stack)-1]
+			} else if !isAbs {
+				stack = append(stack, "..")
+			}
+		default:
+			stack = append(stack, seg)
+		}
+	}
+	joined := strings.Join(stack, "/")
+	if isAbs {
+		return "/" + joined
+	}
+	if joined == "" {
+		return "."
+	}
+	return joined
+}
+
 func matchGlob(pattern, value string) bool {
 	if pattern == "" || value == "" {
 		return false

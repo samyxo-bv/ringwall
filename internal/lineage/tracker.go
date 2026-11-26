@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,11 +17,16 @@ import (
 const (
 	maxCacheEntries = 4096
 	maxAncestryWalk = 16
+	atFDCWD         = -100
 )
+
+var procRootPrefixRe = regexp.MustCompile(`^/proc/(?:self|thread-self|[0-9]+)/root(/|$)`)
 
 // ProcReader abstracts /proc lookups for testability.
 type ProcReader interface {
 	ReadProcess(pid int) (model.ProcessInfo, bool)
+	ReadFDPath(pid int, fd int32) (string, bool)
+	EvalSymlinks(path string) string
 }
 
 type linuxProcReader struct{}
@@ -34,11 +41,12 @@ func (linuxProcReader) ReadProcess(pid int) (model.ProcessInfo, bool) {
 		return model.ProcessInfo{}, false
 	}
 
-	comm, ppid := parseProcStat(string(statBytes))
+	comm, ppid, startTime := ParseProcStat(string(statBytes))
 	info := model.ProcessInfo{
-		PID:  pid,
-		PPID: ppid,
-		Comm: comm,
+		PID:       pid,
+		PPID:      ppid,
+		StartTime: startTime,
+		Comm:      comm,
 	}
 
 	if cmdBytes, err := os.ReadFile(base + "/cmdline"); err == nil && len(cmdBytes) > 0 {
@@ -52,7 +60,7 @@ func (linuxProcReader) ReadProcess(pid int) (model.ProcessInfo, bool) {
 		info.Cmdline = strings.Join(out, " ")
 	}
 	if exe, err := os.Readlink(base + "/exe"); err == nil {
-		info.Exe = exe
+		info.Exe = strings.TrimSuffix(exe, " (deleted)")
 	}
 	if cwd, err := os.Readlink(base + "/cwd"); err == nil {
 		info.Cwd = cwd
@@ -63,19 +71,42 @@ func (linuxProcReader) ReadProcess(pid int) (model.ProcessInfo, bool) {
 	return info, true
 }
 
-func parseProcStat(stat string) (comm string, ppid int) {
+func (linuxProcReader) ReadFDPath(pid int, fd int32) (string, bool) {
+	if pid <= 0 || fd < 0 {
+		return "", false
+	}
+	p, err := os.Readlink(fmt.Sprintf("/proc/%d/fd/%d", pid, fd))
+	if err != nil {
+		return "", false
+	}
+	return p, true
+}
+
+func (linuxProcReader) EvalSymlinks(path string) string {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return path
+	}
+	return resolved
+}
+
+// ParseProcStat parses comm, ppid, and starttime (field 22) from /proc/<pid>/stat.
+func ParseProcStat(stat string) (comm string, ppid int, startTime uint64) {
 	openIdx := strings.IndexByte(stat, '(')
 	closeIdx := strings.LastIndexByte(stat, ')')
 	if openIdx < 0 || closeIdx <= openIdx || closeIdx+2 >= len(stat) {
-		return "", 0
+		return "", 0, 0
 	}
 	comm = stat[openIdx+1 : closeIdx]
 	rest := strings.Fields(stat[closeIdx+2:])
-	// rest[0] is state, rest[1] is ppid
+	// rest[0] is field 3 (state), rest[1] is field 4 (ppid), rest[19] is field 22 (starttime).
 	if len(rest) >= 2 {
 		ppid, _ = strconv.Atoi(rest[1])
 	}
-	return comm, ppid
+	if len(rest) >= 20 {
+		startTime, _ = strconv.ParseUint(rest[19], 10, 64)
+	}
+	return comm, ppid, startTime
 }
 
 func parseUIDFromStatus(status string) uint32 {
@@ -93,8 +124,98 @@ func parseUIDFromStatus(status string) uint32 {
 	return 0
 }
 
-// Tracker resolves process details and full ancestor chains with an in-memory cache
-// so short-lived child processes still preserve their ancestry.
+// ReadProcessStartTime reads field 22 (starttime) of /proc/<pid>/stat for PID-reuse verification.
+func ReadProcessStartTime(pid int) (uint64, bool) {
+	if pid <= 0 {
+		return 0, false
+	}
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, false
+	}
+	_, _, st := ParseProcStat(string(b))
+	return st, st > 0
+}
+
+// CanonicalizePath normalizes /etc//shadow, /etc/./shadow, /proc/<pid|self>/root/...,
+// relative paths (via dirfd or cwd), and symlinks so path-based policy bypasses cannot evade rules.
+func CanonicalizePath(rawPath string, dirfd int32, cwd string, fdResolver func(int32) (string, bool), evalSymlinks func(string) string) string {
+	if rawPath == "" {
+		return ""
+	}
+	p := filepath.ToSlash(rawPath)
+
+	if !strings.HasPrefix(p, "/") {
+		base := ""
+		if dirfd >= 0 && fdResolver != nil {
+			if resolvedDir, ok := fdResolver(dirfd); ok {
+				base = filepath.ToSlash(resolvedDir)
+			}
+		}
+		if base == "" && cwd != "" {
+			base = filepath.ToSlash(cwd)
+		}
+		if base != "" {
+			p = strings.TrimRight(base, "/") + "/" + p
+		}
+	}
+
+	p = cleanSlashPath(p)
+
+	// Strip /proc/self/root/..., /proc/thread-self/root/..., or /proc/<pid>/root/... prefixes (repeatedly).
+	for i := 0; i < 4; i++ {
+		if !procRootPrefixRe.MatchString(p) {
+			break
+		}
+		p = procRootPrefixRe.ReplaceAllString(p, "/")
+		p = cleanSlashPath(p)
+	}
+
+	if evalSymlinks != nil && strings.HasPrefix(p, "/") {
+		if sym := evalSymlinks(p); sym != "" {
+			p = cleanSlashPath(filepath.ToSlash(sym))
+			for i := 0; i < 2; i++ {
+				if !procRootPrefixRe.MatchString(p) {
+					break
+				}
+				p = procRootPrefixRe.ReplaceAllString(p, "/")
+				p = cleanSlashPath(p)
+			}
+		}
+	}
+
+	return p
+}
+
+func cleanSlashPath(p string) string {
+	// Manual POSIX clean so Windows unit tests also preserve leading '/' cleanly.
+	isAbs := strings.HasPrefix(p, "/")
+	parts := strings.Split(p, "/")
+	stack := make([]string, 0, len(parts))
+	for _, seg := range parts {
+		switch seg {
+		case "", ".":
+			continue
+		case "..":
+			if len(stack) > 0 && stack[len(stack)-1] != ".." {
+				stack = stack[:len(stack)-1]
+			} else if !isAbs {
+				stack = append(stack, "..")
+			}
+		default:
+			stack = append(stack, seg)
+		}
+	}
+	joined := strings.Join(stack, "/")
+	if isAbs {
+		return "/" + joined
+	}
+	if joined == "" {
+		return "."
+	}
+	return joined
+}
+
 type Tracker struct {
 	mu     sync.RWMutex
 	cache  map[int]model.ProcessInfo
@@ -141,15 +262,20 @@ func (t *Tracker) lookup(pid int) (model.ProcessInfo, bool) {
 	return cached, ok
 }
 
-// Enrich populates missing process metadata and the ancestor chain on an event.
+// Enrich populates process metadata, start time, canonical file path, and full ancestry.
 func (t *Tracker) Enrich(ev *model.Event) {
 	if ev == nil || ev.PID <= 0 {
 		return
 	}
 
+	var cwd string
 	if live, ok := t.lookup(ev.PID); ok {
+		cwd = live.Cwd
 		if ev.PPID == 0 {
 			ev.PPID = live.PPID
+		}
+		if ev.StartTime == 0 {
+			ev.StartTime = live.StartTime
 		}
 		if ev.Comm == "" {
 			ev.Comm = live.Comm
@@ -165,14 +291,29 @@ func (t *Tracker) Enrich(ev *model.Event) {
 		}
 	}
 
-	// Store latest known info for this PID so descendants can trace back to it.
+	if ev.Path != "" {
+		ev.RawPath = ev.Path
+		ev.Path = CanonicalizePath(
+			ev.Path,
+			ev.DirFD,
+			cwd,
+			func(fd int32) (string, bool) { return t.reader.ReadFDPath(ev.PID, fd) },
+			t.reader.EvalSymlinks,
+		)
+	}
+	if ev.Exe != "" {
+		ev.Exe = CanonicalizePath(ev.Exe, atFDCWD, cwd, nil, t.reader.EvalSymlinks)
+	}
+
 	t.Record(model.ProcessInfo{
-		PID:     ev.PID,
-		PPID:    ev.PPID,
-		UID:     ev.UID,
-		Comm:    ev.Comm,
-		Exe:     ev.Exe,
-		Cmdline: ev.Cmdline,
+		PID:       ev.PID,
+		PPID:      ev.PPID,
+		UID:       ev.UID,
+		StartTime: ev.StartTime,
+		Comm:      ev.Comm,
+		Exe:       ev.Exe,
+		Cmdline:   ev.Cmdline,
+		Cwd:       cwd,
 	})
 
 	if len(ev.Ancestry) > 0 {

@@ -17,11 +17,8 @@ if [[ ! -x "${ROOT_DIR}/bin/ringwalld" || ! -x "${ROOT_DIR}/bin/ringwallctl" ]];
   exit 1
 fi
 
-getent group ringwall >/dev/null || groupadd --system ringwall
-
-install -d -m 0755 /usr/local/bin /usr/lib/ringwall /etc/ringwall/policies.d
-install -d -m 0700 /etc/ringwall/keys
-install -d -m 0750 -g ringwall /var/log/ringwall /run/ringwall
+install -d -m 0755 /usr/local/bin /usr/lib/ringwall /etc/ringwall/policies.d /run/ringwall-status
+install -d -m 0700 /etc/ringwall/keys /var/log/ringwall /run/ringwall
 
 install -m 0755 "${ROOT_DIR}/bin/ringwalld" /usr/local/bin/ringwalld
 install -m 0755 "${ROOT_DIR}/bin/ringwallctl" /usr/local/bin/ringwallctl
@@ -31,7 +28,7 @@ if [[ -f "${ROOT_DIR}/internal/sensor/ringwall.bpf.o" ]]; then
 fi
 
 if [[ ! -f /etc/ringwall/ringwall.yaml ]]; then
-  install -m 0640 -g ringwall "${ROOT_DIR}/packaging/ringwall.yaml" /etc/ringwall/ringwall.yaml
+  install -m 0600 "${ROOT_DIR}/packaging/ringwall.yaml" /etc/ringwall/ringwall.yaml
 fi
 
 install -m 0644 "${ROOT_DIR}"/policies/*.yaml /etc/ringwall/policies.d/
@@ -46,4 +43,4 @@ echo "Ringwall installed and running."
 echo "Guided Setup:  sudo ringwallctl setup"
 echo "Check status:  sudo ringwallctl status"
 echo "Run self-test: sudo ringwallctl simulate"
-echo "Web Dashboard: http://127.0.0.1:9443 (token in /run/ringwall/api.token)"
+echo "Web Dashboard: http://127.0.0.1:9443 (root-only token in /run/ringwall/api.token)"

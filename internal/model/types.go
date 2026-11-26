@@ -68,7 +68,6 @@ func (a Action) Rank() int {
 	}
 }
 
-// MaxAction returns the stricter of two actions.
 func MaxAction(a, b Action) Action {
 	if b.Rank() > a.Rank() {
 		return b
@@ -77,13 +76,14 @@ func MaxAction(a, b Action) Action {
 }
 
 type ProcessInfo struct {
-	PID     int    `json:"pid"`
-	PPID    int    `json:"ppid"`
-	UID     uint32 `json:"uid"`
-	Comm    string `json:"comm"`
-	Exe     string `json:"exe,omitempty"`
-	Cmdline string `json:"cmdline,omitempty"`
-	Cwd     string `json:"cwd,omitempty"`
+	PID       int    `json:"pid"`
+	PPID      int    `json:"ppid"`
+	UID       uint32 `json:"uid"`
+	StartTime uint64 `json:"start_time,omitempty"`
+	Comm      string `json:"comm"`
+	Exe       string `json:"exe,omitempty"`
+	Cmdline   string `json:"cmdline,omitempty"`
+	Cwd       string `json:"cwd,omitempty"`
 }
 
 type Event struct {
@@ -92,10 +92,14 @@ type Event struct {
 	PID       int           `json:"pid"`
 	PPID      int           `json:"ppid"`
 	UID       uint32        `json:"uid"`
+	StartTime uint64        `json:"start_time,omitempty"`
+	DirFD     int32         `json:"dirfd,omitempty"`
 	Comm      string        `json:"comm"`
 	Exe       string        `json:"exe,omitempty"`
 	Path      string        `json:"path,omitempty"`
+	RawPath   string        `json:"raw_path,omitempty"`
 	Cmdline   string        `json:"cmdline,omitempty"`
+	Argv      []string      `json:"argv,omitempty"`
 	Flags     uint32        `json:"flags,omitempty"`
 	IsWrite   bool          `json:"is_write,omitempty"`
 	DstIP     string        `json:"dst_ip,omitempty"`
@@ -168,6 +172,8 @@ type Incident struct {
 	EffectiveAction     Action         `json:"effective_action"`
 	Severity            Severity       `json:"severity"`
 	Status              IncidentStatus `json:"status"`
+	OperatorDecided     bool           `json:"operator_decided,omitempty"`
+	CgroupFrozenPath    string         `json:"cgroup_frozen_path,omitempty"`
 	EnforcementNote     string         `json:"enforcement_note,omitempty"`
 	AI                  *AIAnalysis    `json:"ai,omitempty"`
 }
@@ -179,6 +185,7 @@ type DaemonStatus struct {
 	StartedAt      time.Time `json:"started_at"`
 	PolicyCount    int       `json:"policy_count"`
 	EventsTotal    uint64    `json:"events_total"`
+	DroppedEvents  uint64    `json:"dropped_events"`
 	IncidentsTotal uint64    `json:"incidents_total"`
 	FrozenCount    int       `json:"frozen_count"`
 	AIEnabled      bool      `json:"ai_enabled"`

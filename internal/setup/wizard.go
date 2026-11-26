@@ -291,6 +291,12 @@ func BuildAndSaveConfig(baseCfg *config.Config, cfgPath, keyDir string, req Appl
 	next.AI.Model = ""
 	next.AI.Models = make([]config.AIModelConfig, 0, len(req.Models))
 
+	type pendingKey struct {
+		path string
+		val  string
+	}
+	var keysToWrite []pendingKey
+
 	for i, in := range req.Models {
 		name := strings.TrimSpace(in.Name)
 		if name == "" {
@@ -316,14 +322,9 @@ func BuildAndSaveConfig(baseCfg *config.Config, cfgPath, keyDir string, req Appl
 			if keyDir == "" {
 				return nil, fmt.Errorf("key directory not configured")
 			}
-			if err := os.MkdirAll(keyDir, 0o700); err != nil {
-				return nil, fmt.Errorf("create key dir: %w", err)
-			}
 			keyFile := filepath.Join(keyDir, name+".key")
-			if err := os.WriteFile(keyFile, []byte(key+"\n"), 0o600); err != nil {
-				return nil, fmt.Errorf("write key file: %w", err)
-			}
 			mc.APIKeyFile = keyFile
+			keysToWrite = append(keysToWrite, pendingKey{path: keyFile, val: key})
 		}
 
 		if err := config.ValidateModel(mc, false); err != nil {
@@ -334,6 +335,28 @@ func BuildAndSaveConfig(baseCfg *config.Config, cfgPath, keyDir string, req Appl
 
 	if err := next.Validate(); err != nil {
 		return nil, err
+	}
+
+	// Only persist secret key files AFTER full validation succeeds, enforcing strict 0600 permissions.
+	for _, k := range keysToWrite {
+		if err := os.MkdirAll(keyDir, 0o700); err != nil {
+			return nil, fmt.Errorf("create key dir: %w", err)
+		}
+		f, err := os.OpenFile(k.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			return nil, fmt.Errorf("open key file: %w", err)
+		}
+		if err := f.Chmod(0o600); err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("chmod key file: %w", err)
+		}
+		if _, err := f.WriteString(k.val + "\n"); err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("write key file: %w", err)
+		}
+		if err := f.Close(); err != nil {
+			return nil, err
+		}
 	}
 
 	if cfgPath != "" {

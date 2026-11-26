@@ -14,9 +14,9 @@ jobs:
     name: eBPF + Go Build & Race Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: "1.24"
 
@@ -25,25 +25,58 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang llvm libbpf-dev linux-libc-dev
 
-      - name: Tidy and verify Go modules
-        run: go mod tidy
+      - name: Verify Go modules (readonly, committed go.sum)
+        run: go mod verify
 
       - name: Compile eBPF tracepoint object
         run: make bpf
 
       - name: Run go vet and full race test suite
         run: |
-          go vet ./...
-          go test -race -v ./...
+          go vet -mod=readonly ./...
+          go test -mod=readonly -race -v ./...
 
       - name: Build static Linux binaries with embedded eBPF
-        run: make build
+        run: |
+          mkdir -p bin
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=readonly -tags ebpf_embed -ldflags "-s -w" -o bin/ringwalld ./cmd/ringwalld
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=readonly -ldflags "-s -w" -o bin/ringwallctl ./cmd/ringwallctl
 
       - name: Validate built-in YAML policy packs
         run: ./bin/ringwallctl policy-check ./policies
 
+      - name: Live root host integration test (eBPF + 0600 token + simulate + audit verify)
+        run: |
+          TMPDIR="$(mktemp -d)"
+          sudo mkdir -p "${TMPDIR}/run" "${TMPDIR}/log"
+          cat > "${TMPDIR}/ringwall.yaml" <<EOF
+          mode: interactive
+          policy_dirs:
+            - ${PWD}/policies
+          audit_log_path: ${TMPDIR}/log/audit.jsonl
+          sensor:
+            mode: auto
+          enforcer:
+            enable_signals: true
+            enable_nftables: false
+          ai:
+            enabled: false
+          api:
+            listen_addr: 127.0.0.1:19443
+            token_file: ${TMPDIR}/run/api.token
+          EOF
+          sudo ./bin/ringwalld -config "${TMPDIR}/ringwall.yaml" &
+          DPID=$!
+          trap "sudo kill $DPID 2>/dev/null || true" EXIT
+          for i in $(seq 1 20); do sudo test -f "${TMPDIR}/run/api.token" && break; sleep 0.5; done
+          PERM="$(sudo stat -c '%a' "${TMPDIR}/run/api.token")"
+          test "${PERM}" = "600"
+          sudo ./bin/ringwallctl -api http://127.0.0.1:19443 -token-file "${TMPDIR}/run/api.token" status
+          sudo ./bin/ringwallctl -api http://127.0.0.1:19443 -token-file "${TMPDIR}/run/api.token" simulate
+          sudo ./bin/ringwallctl verify-log "${TMPDIR}/log/audit.jsonl"
+
       - name: Upload compiled Linux binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ringwall-linux-amd64
           path: |
@@ -56,10 +89,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-and-test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Download compiled Linux binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: ringwall-linux-amd64
           path: .
@@ -84,11 +117,11 @@ jobs:
       - name: Build hardened immutable bootable ISO
         run: sudo ./iso/build-iso.sh --out dist/ringwall-appliance-amd64.iso
 
-      - name: Boot ISO in QEMU & verify live eBPF freeze + attack tests
+      - name: Boot ISO in QEMU & verify 8 live security assertions
         run: ./iso/test-qemu.sh dist/ringwall-appliance-amd64.iso
 
       - name: Upload verified bootable ISO
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ringwall-appliance-amd64-iso
           path: |

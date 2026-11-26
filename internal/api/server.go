@@ -94,12 +94,13 @@ func loadOrGenerateToken(path string) (string, error) {
 	}
 	tok := hex.EncodeToString(raw[:])
 	if path != "" {
-		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			return "", fmt.Errorf("create token dir: %w", err)
 		}
-		if err := os.WriteFile(path, []byte(tok+"\n"), 0o640); err != nil {
+		if err := os.WriteFile(path, []byte(tok+"\n"), 0o600); err != nil {
 			return "", fmt.Errorf("write token file %s: %w", path, err)
 		}
+		_ = os.Chmod(path, 0o600)
 	}
 	return tok, nil
 }
