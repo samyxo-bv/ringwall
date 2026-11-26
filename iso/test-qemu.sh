@@ -113,7 +113,6 @@ try:
 
     # 4. LIVE KERNEL E2E ATTACK: real process reading ~/.ssh/id_ed25519 MUST be frozen by eBPF + SIGSTOP!
     out = run_cmd(
-        "mkdir -p ~/.ssh && printf 'DUMMY-PRIVATE-KEY\\n' > ~/.ssh/id_ed25519 && "
         "python3 -c \"open('/home/operator/.ssh/id_ed25519').read(); import time; time.sleep(25)\" & "
         "APID=$!; sleep 2; grep '^State:' /proc/$APID/status; kill -9 $APID 2>/dev/null || true"
     )

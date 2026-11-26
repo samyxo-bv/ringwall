@@ -102,8 +102,14 @@ EOF
 # Lock root password; create unprivileged local console user 'operator' in group 'ringwall' (no sudo!).
 chroot "${CHROOT}" passwd -l root
 chroot "${CHROOT}" groupadd --system ringwall
-chroot "${CHROOT}" useradd -m -s /bin/bash -G ringwall operator
+chroot "${CHROOT}" useradd -m -s /bin/bash -N -g users -G ringwall operator
 chroot "${CHROOT}" passwd -d operator
+
+# Pre-seed a harmless canary decoy key so users and QEMU E2E tests can safely verify live eBPF SIGSTOP freezing.
+install -d -m 0700 "${CHROOT}/home/operator/.ssh"
+printf 'RINGWALL-CANARY-DECOY-NOT-A-REAL-PRIVATE-KEY\n' > "${CHROOT}/home/operator/.ssh/id_ed25519"
+chmod 0600 "${CHROOT}/home/operator/.ssh/id_ed25519"
+chroot "${CHROOT}" chown -R operator:users /home/operator/.ssh
 
 # Local/serial appliance autologin as unprivileged operator (no SSH server installed).
 mkdir -p "${CHROOT}/etc/systemd/system/serial-getty@ttyS0.service.d"
