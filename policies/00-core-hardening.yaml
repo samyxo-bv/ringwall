@@ -1,0 +1,101 @@
+# Ringwall Core Host Hardening Policies
+rules:
+  - id: RW-CORE-001
+    name: Interactive reverse shell pattern
+    category: core-hardening
+    severity: critical
+    action: kill
+    mitre: T1059.004
+    description: Detects shell commands spawning classic TCP/UDP reverse shells (/dev/tcp, nc -e, socat exec, python pty socket).
+    match:
+      event_types: [exec]
+      cmdline_regex:
+        - '/dev/(tcp|udp)/[0-9a-zA-Z\.\-]+/[0-9]+'
+        - '(^|\s)(nc|ncat|netcat)\s+.*(\s-e\s|\s-c\s|--sh-exec)'
+        - 'socat\s+.*exec:'
+        - 'python3?\s+-c\s+.*socket.*(subprocess|pty\.spawn)'
+
+  - id: RW-CORE-002
+    name: Pipe-to-shell remote code execution
+    category: core-hardening
+    severity: high
+    action: freeze
+    mitre: T1059.004
+    description: Detects curl or wget piping remote content directly into sh or bash.
+    match:
+      event_types: [exec]
+      cmdline_regex:
+        - '(curl|wget)\s+.*\|\s*(sudo\s+)?(ba)?sh(\s|$)'
+
+  - id: RW-CORE-003
+    name: Sensitive password database access (/etc/shadow)
+    category: core-hardening
+    severity: critical
+    action: freeze
+    mitre: T1003.008
+    description: Flags non-authentication binaries reading /etc/shadow or /etc/gshadow.
+    match:
+      event_types: [open]
+      path_globs:
+        - '/etc/shadow'
+        - '/etc/gshadow'
+      exclude_comm:
+        - login
+        - su
+        - sudo
+        - passwd
+        - sshd
+        - systemd
+        - unix_chkpwd
+        - chage
+        - useradd
+        - usermod
+
+  - id: RW-CORE-004
+    name: Persistence write to cron or systemd units
+    category: core-hardening
+    severity: critical
+    action: freeze
+    mitre: T1053.003
+    description: Detects writes to /etc/cron*, /var/spool/cron*, or /etc/systemd/system/*.
+    match:
+      event_types: [open]
+      require_write: true
+      path_globs:
+        - '/etc/crontab'
+        - '/etc/cron.d/*'
+        - '/etc/cron.*/*'
+        - '/var/spool/cron/**'
+        - '/etc/systemd/system/**'
+      exclude_comm:
+        - dpkg
+        - apt
+        - apt-get
+        - systemd
+        - systemctl
+
+  - id: RW-CORE-005
+    name: SSH authorized_keys modification
+    category: core-hardening
+    severity: high
+    action: freeze
+    mitre: T1098.004
+    description: Detects writes to authorized_keys files that could establish persistent remote access.
+    match:
+      event_types: [open]
+      require_write: true
+      path_globs:
+        - '**/.ssh/authorized_keys'
+        - '**/.ssh/authorized_keys2'
+
+  - id: RW-CORE-006
+    name: Kernel module insertion attempt
+    category: core-hardening
+    severity: critical
+    action: freeze
+    mitre: T1547.006
+    description: Flags insmod or modprobe invocations outside early boot.
+    match:
+      event_types: [exec]
+      comm_in: [insmod, modprobe]
+      exclude_comm: [systemd-udevd, udevd]
