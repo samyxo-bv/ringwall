@@ -26,7 +26,7 @@ var procRootPrefixRe = regexp.MustCompile(`^/proc/(?:self|thread-self|[0-9]+)/ro
 type ProcReader interface {
 	ReadProcess(pid int) (model.ProcessInfo, bool)
 	ReadFDPath(pid int, fd int32) (string, bool)
-	EvalSymlinks(path string) string
+	EvalSymlinks(pid int, path string) string
 }
 
 type linuxProcReader struct{}
@@ -82,7 +82,30 @@ func (linuxProcReader) ReadFDPath(pid int, fd int32) (string, bool) {
 	return p, true
 }
 
-func (linuxProcReader) EvalSymlinks(path string) string {
+func (linuxProcReader) EvalSymlinks(pid int, path string) string {
+	// Resolve symlinks inside the target process's mount namespace via /proc/<pid>/root
+	// so PrivateTmp=yes and container mount namespaces never hide /tmp/* symlinks.
+	if pid > 0 && strings.HasPrefix(path, "/") {
+		cur := cleanSlashPath(path)
+		for hop := 0; hop < 8; hop++ {
+			target, err := os.Readlink(fmt.Sprintf("/proc/%d/root%s", pid, cur))
+			if err != nil {
+				break
+			}
+			if strings.HasPrefix(target, "/") {
+				cur = cleanSlashPath(target)
+			} else {
+				dir := cur[:strings.LastIndexByte(cur, '/')]
+				if dir == "" {
+					dir = "/"
+				}
+				cur = cleanSlashPath(dir + "/" + target)
+			}
+		}
+		if cur != cleanSlashPath(path) {
+			return cur
+		}
+	}
 	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		return path
@@ -298,11 +321,11 @@ func (t *Tracker) Enrich(ev *model.Event) {
 			ev.DirFD,
 			cwd,
 			func(fd int32) (string, bool) { return t.reader.ReadFDPath(ev.PID, fd) },
-			t.reader.EvalSymlinks,
+			func(p string) string { return t.reader.EvalSymlinks(ev.PID, p) },
 		)
 	}
 	if ev.Exe != "" {
-		ev.Exe = CanonicalizePath(ev.Exe, atFDCWD, cwd, nil, t.reader.EvalSymlinks)
+		ev.Exe = CanonicalizePath(ev.Exe, atFDCWD, cwd, nil, func(p string) string { return t.reader.EvalSymlinks(ev.PID, p) })
 	}
 
 	t.Record(model.ProcessInfo{

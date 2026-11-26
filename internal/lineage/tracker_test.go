@@ -27,7 +27,7 @@ func (f *fakeProcReader) ReadFDPath(pid int, fd int32) (string, bool) {
 	return "", false
 }
 
-func (f *fakeProcReader) EvalSymlinks(path string) string {
+func (f *fakeProcReader) EvalSymlinks(_ int, path string) string {
 	if s, ok := f.symlinks[path]; ok {
 		return s
 	}

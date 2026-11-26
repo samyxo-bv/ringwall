@@ -141,7 +141,7 @@ try:
     assert "T (stopped)" in out, f"Expected relative-path SSH bypass frozen (T stopped), got:\n{out}"
 
     out = run_cmd(
-        "ln -sf /home/operator/.ssh/id_ed25519 /tmp/k && "
+        "ln -sf /home/operator/.ssh/id_ed25519 /tmp/k; "
         "python3 -c \"open('/tmp/k').read(); import time; time.sleep(25)\" & "
         "SPID=$!; sleep 2; grep '^State:' /proc/$SPID/status; kill -9 $SPID 2>/dev/null || true"
     )
