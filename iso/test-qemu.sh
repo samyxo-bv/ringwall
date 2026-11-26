@@ -79,9 +79,11 @@ def read_until(marker: bytes, timeout: float) -> str:
     tail = buf.decode("utf-8", errors="replace")[-2000:]
     raise RuntimeError(f"Timeout waiting for {marker!r}. Last output:\n{tail}")
 
-def run_cmd(shell_cmd: str, timeout: float = 30.0) -> str:
-    sentinel = f"__RW_DONE_{int(time.time()*1000)}__"
-    full = f"{shell_cmd}; echo {sentinel}:$?\n"
+def run_cmd(shell_cmd: str, timeout: float = 45.0) -> str:
+    tag = str(int(time.time() * 1000))
+    sentinel = f"__RW_DONE_{tag}__"
+    # Split sentinel in the sent command so serial TTY echo never prematurely matches read_until.
+    full = f'{shell_cmd}; echo "__RW""_DONE_{tag}__:$?"\n'
     os.write(master_fd, full.encode("utf-8"))
     out = read_until(sentinel.encode("utf-8"), timeout)
     time.sleep(0.2)
@@ -107,7 +109,7 @@ try:
     assert "NO_SSHD_OK" in out, f"sshd must not be installed:\n{out}"
 
     # 3. Wait for ringwalld API token and verify live eBPF sensor + policies loaded
-    out = run_cmd("for i in $(seq 1 25); do [ -r /run/ringwall/api.token ] && break; sleep 1; done; ringwallctl status")
+    out = run_cmd("for i in $(seq 1 25); do [ -r /run/ringwall/api.token ] && break; sleep 1; done; ringwallctl status || systemctl status ringwalld --no-pager", timeout=60.0)
     assert "Sensor:     ebpf" in out, f"Expected live eBPF sensor in ISO, got:\n{out}"
     assert "Policies:   " in out and "Policies:   0" not in out, f"Expected policies loaded, got:\n{out}"
 
