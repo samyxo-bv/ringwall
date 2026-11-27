@@ -110,7 +110,7 @@ try:
     print("\n[qemu-e2e] Boot complete! Running 15 live LSM + self-healing security assertions...\n", flush=True)
 
     # 1. Read-only SquashFS lower rootfs & no SSH server
-    out = run_cmd("mount | grep -E 'squashfs.*\\bro\\b' && test ! -x /usr/sbin/sshd && echo BASE_HARDENED_OK")
+    out = run_cmd("mount | grep -E 'squashfs.*\\bro\\b' && test ! -x /usr/sbin/sshd && echo \"BASE_HARDENED\"\"_OK\"")
     assert "BASE_HARDENED_OK" in out, f"Expected ro squashfs + no sshd, got:\n{out}"
 
     # 2. Wait for ringwalld public health snapshot and verify live eBPF LSM blocking
@@ -136,7 +136,7 @@ try:
             "FPID=''; "
             "for _ in $(seq 1 16); do "
             "  for p in $TPID $(pgrep -P $TPID 2>/dev/null); do "
-            "    if grep -q 'T (stopped)' /proc/$p/status 2>/dev/null; then FPID=$p; break 2; fi; "
+            "    if grep -q '(stopped)' /proc/$p/status 2>/dev/null; then FPID=$p; break 2; fi; "
             "  done; "
             "  sleep 0.5; "
             "done; "
@@ -148,21 +148,20 @@ try:
 
     def assert_lsm_eperm(py_expr: str, label: str):
         # Proves synchronous kernel -EPERM BEFORE a single byte is read (0 bytes leaked!).
-        # Polls /tmp/lsm_out up to 6s; if ringwalld froze python3 mid-exception-formatting under TCG,
-        # resumes once so python3 flushes the errno it ALREADY received from the kernel open() syscall.
+        # Uses split sentinel markers and [ -s /tmp/lsm_out ] so TTY echo never collides with assertions.
         wrapped = (
-            f'python3 -u -c "import os\ntry:\n {py_expr}\n print(\'LEAKED_\' + \'BYTES\')\nexcept OSError as e:\n print(\'EPERM_\' + \'OK:\', e.errno)" > /tmp/lsm_out 2>&1 & '
+            f'python3 -u -c "import os\ntry:\n {py_expr}\n print(\'LEAK_\' + \'DATA\')\nexcept OSError as e:\n print(\'BLK_\' + \'ERRNO:\', e.errno)" > /tmp/lsm_out 2>&1 & '
             "TPID=$!; "
             "for _ in $(seq 1 12); do "
-            "  grep -qE 'EPERM_OK:|LEAKED_BYTES' /tmp/lsm_out 2>/dev/null && break; "
-            "  grep -q 'T (stopped)' /proc/$TPID/status 2>/dev/null && kill -CONT $TPID 2>/dev/null || true; "
+            "  [ -s /tmp/lsm_out ] && break; "
+            "  grep -q '(stopped)' /proc/$TPID/status 2>/dev/null && kill -CONT $TPID 2>/dev/null || true; "
             "  sleep 0.5; "
             "done; "
             "kill -9 $TPID 2>/dev/null || true; wait $TPID 2>/dev/null || true; cat /tmp/lsm_out; rm -f /tmp/lsm_out"
         )
         out = run_cmd(wrapped)
-        assert "EPERM_OK: 1" in out, f"{label} was NOT synchronously blocked with EPERM (errno=1), got:\n{out}"
-        assert "LEAKED_BYTES" not in out and "RINGWALL-CANARY" not in out, f"{label} LEAKED BYTES:\n{out}"
+        assert "BLK_ERRNO: 1" in out, f"{label} was NOT synchronously blocked with EPERM (errno=1), got:\n{out}"
+        assert "LEAK_DATA" not in out and "RINGWALL-CANARY" not in out, f"{label} LEAKED BYTES:\n{out}"
 
     # 4. io_uring_setup syscall (425) -> caught by eBPF and frozen
     assert_frozen(
