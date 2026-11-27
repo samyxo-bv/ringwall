@@ -297,7 +297,7 @@ jobs:
             ! echo "${POS_OUT}" | grep -qi "Operation not permitted"
 
             # Live P1-A proof on opt-in ssh-keygen: LD_PRELOAD blocked at ld.so map time (main/pthread/fork never run):
-            RW_TARGET_KEY="${TMPDIR}/ldp/.ssh/id_ed25519" LD_PRELOAD="${TMPDIR}/ldp/evil.so" timeout 10 /usr/bin/ssh-keygen -l -f /dev/null >"${TMPDIR}/ldp_out" 2>&1 || true
+            timeout 10 env "RW_TARGET_KEY=${TMPDIR}/ldp/.ssh/id_ed25519" "LD_PRELOAD=${TMPDIR}/ldp/evil.so" /usr/bin/ssh-keygen -l -f /dev/null >"${TMPDIR}/ldp_out" 2>&1 || true
             cat "${TMPDIR}/ldp_out"
             grep -qE "(failed to map segment|Operation not permitted|cannot be preloaded)" "${TMPDIR}/ldp_out"
             ! grep -q "LDP_LEAKED" "${TMPDIR}/ldp_out"
