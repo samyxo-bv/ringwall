@@ -185,13 +185,19 @@ try:
         "N1 //home double-slash LSM block",
     )
 
-    # 7. HARDLINK-PROOF INODE LSM BLOCK: ln ~/.ssh/id_ed25519 ~/hardlink_key -> reading ~/hardlink_key -> EPERM!
-    run_cmd("ln -f /home/operator/.ssh/id_ed25519 /home/operator/hardlink_key")
+    # 7. HARDLINK-PROOF INODE LSM BLOCK:
+    # (a) Creating a new hardlink to ~/.ssh/id_ed25519 fails (EPERM during copy-up or blocked read if created)
+    out = run_cmd("(ln -f /home/operator/.ssh/id_ed25519 /home/operator/new_hl 2>&1 && echo \"NEW_HL\"\"_CREATED\" || echo \"NEW_HL\"\"_BLOCKED\")")
+    if "NEW_HL_CREATED" in out:
+        assert_lsm_eperm("open('/home/operator/new_hl').read()", "Newly created hardlink inode LSM block")
+        run_cmd("rm -f /home/operator/new_hl")
+    else:
+        assert "NEW_HL_BLOCKED" in out, f"Unexpected new hardlink result:\n{out}"
+    # (b) Preexisting hardlink outside .ssh (/home/operator/preexisting_hardlink_canary) -> EPERM via lsm_deny_file_inodes!
     assert_lsm_eperm(
-        "open('/home/operator/hardlink_key').read()",
-        "Hardlink inode-pinned SSH key LSM block",
+        "open('/home/operator/preexisting_hardlink_canary').read()",
+        "Preexisting hardlink inode-pinned SSH key LSM block",
     )
-    run_cmd("rm -f /home/operator/hardlink_key")
 
     # 8. ANTI-SPOOF EXE-INODE BLOCK: cp /bin/cat /tmp/ssh && /tmp/ssh ~/.ssh/id_ed25519 -> EPERM!
     run_cmd("cp /bin/cat /tmp/ssh && chmod +x /tmp/ssh")

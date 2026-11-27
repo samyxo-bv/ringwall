@@ -29,7 +29,7 @@ jobs:
 
       - name: Install pinned govulncheck and scan for known Go CVEs
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          go install golang.org/x/vuln/cmd/govulncheck@v1.10.0
           "$(go env GOPATH)/bin/govulncheck" ./...
 
       - name: Run go vet and scanner/patcher race suite
