@@ -57,30 +57,54 @@ var protectedExePaths = map[string]bool{
 	"/bin/passwd":                  true,
 	"/usr/bin/ssh":                 true,
 	"/bin/ssh":                     true,
-	"/usr/sbin/sshd":               true,
-	"/sbin/sshd":                   true,
-	"/usr/lib/openssh/sshd-session": true,
-	"/usr/lib/openssh/sshd-auth":   true,
-	"/lib/openssh/sshd-session":    true,
-	"/lib/openssh/sshd-auth":       true,
-	"/usr/bin/apt-get":             true,
-	"/bin/apt-get":                 true,
-	"/usr/bin/apt":                 true,
-	"/bin/apt":                     true,
-	"/usr/bin/dpkg":                true,
-	"/bin/dpkg":                    true,
-	"/usr/bin/systemctl":           true,
-	"/bin/systemctl":               true,
-	"/usr/sbin/reboot":             true,
-	"/sbin/reboot":                 true,
-	"/usr/sbin/shutdown":           true,
-	"/sbin/shutdown":               true,
+	"/usr/sbin/sshd":                   true,
+	"/sbin/sshd":                       true,
+	"/usr/lib/openssh/sshd-session":    true,
+	"/usr/lib/openssh/sshd-auth":       true,
+	"/lib/openssh/sshd-session":        true,
+	"/lib/openssh/sshd-auth":           true,
+	"/usr/libexec/openssh/sshd-session": true,
+	"/usr/libexec/openssh/sshd-auth":   true,
+	"/usr/libexec/sshd-session":        true,
+	"/usr/libexec/sshd-auth":           true,
+	"/lib/systemd/systemd-executor":    true,
+	"/usr/lib/systemd/systemd-executor": true,
+	"/lib/systemd/systemd-journald":    true,
+	"/usr/lib/systemd/systemd-journald": true,
+	"/lib/systemd/systemd-logind":      true,
+	"/usr/lib/systemd/systemd-logind":  true,
+	"/lib/systemd/systemd-udevd":       true,
+	"/usr/lib/systemd/systemd-udevd":   true,
+	"/lib/systemd/systemd-resolved":    true,
+	"/usr/lib/systemd/systemd-resolved": true,
+	"/lib/systemd/systemd-networkd":    true,
+	"/usr/lib/systemd/systemd-networkd": true,
+	"/usr/bin/dbus-daemon":             true,
+	"/bin/dbus-daemon":                 true,
+	"/usr/bin/dbus-broker":             true,
+	"/usr/bin/apt-get":                 true,
+	"/bin/apt-get":                     true,
+	"/usr/bin/apt":                     true,
+	"/bin/apt":                         true,
+	"/usr/bin/dpkg":                    true,
+	"/bin/dpkg":                        true,
+	"/usr/bin/systemctl":               true,
+	"/bin/systemctl":                   true,
+	"/usr/sbin/reboot":                 true,
+	"/sbin/reboot":                     true,
+	"/usr/sbin/shutdown":               true,
+	"/sbin/shutdown":                   true,
 }
 
-// Critical path prefixes that virtual patches must NEVER match.
+// Critical path prefixes that virtual patches must NEVER match (covers PAM, sudoers, SSH,
+// systemd, login profiles, dynamic linker, root home, and Ringwall control state).
 var forbiddenPathPrefixes = []string{
+	"/root",
+	"/boot",
 	"/etc/ssh",
 	"/etc/pam",
+	"/etc/pam.d",
+	"/etc/pam.conf",
 	"/etc/systemd",
 	"/etc/ringwall",
 	"/etc/passwd",
@@ -88,11 +112,38 @@ var forbiddenPathPrefixes = []string{
 	"/etc/group",
 	"/etc/gshadow",
 	"/etc/sudoers",
+	"/etc/sudoers.d",
+	"/etc/profile",
+	"/etc/profile.d",
+	"/etc/bash.bashrc",
+	"/etc/environment",
+	"/etc/ld.so.preload",
+	"/etc/ld.so.conf",
+	"/etc/ld.so.conf.d",
+	"/lib/systemd",
+	"/usr/lib/systemd",
+	"/usr/lib/openssh",
+	"/usr/libexec/openssh",
 	"/run/ringwall",
 	"/var/lib/ringwall",
 	"/proc",
 	"/sys",
 	"/dev",
+}
+
+// Critical login/shell/SSH filenames that virtual patches must NEVER match anywhere on disk.
+var forbiddenLeafNames = map[string]bool{
+	".profile":         true,
+	".bashrc":          true,
+	".bash_profile":    true,
+	".bash_login":      true,
+	".zshrc":           true,
+	".zprofile":        true,
+	".login":           true,
+	".cshrc":           true,
+	"authorized_keys":  true,
+	"authorized_keys2": true,
+	"known_hosts":      true,
 }
 
 // Critical admin/infrastructure ports forbidden for automated/AI virtual patches.
@@ -120,12 +171,17 @@ type persistedVPFile struct {
 // outside policy_dirs, and fail-closed automatic upstream-fix revocation.
 type VirtualPatchManager struct {
 	mu              sync.RWMutex
+	persistMu       sync.Mutex
 	patches         map[string]VirtualPatch
 	protectedInodes map[inodeID]string
 	protectedPaths  map[string]bool
 	engine          *policy.Engine
 	blocker         KernelBlocker
 	persistPath     string
+}
+
+type protectedExecSetter interface {
+	SetProtectedExecPaths(paths []string)
 }
 
 func NewVirtualPatchManager(engine *policy.Engine, blocker KernelBlocker, persistPath string) *VirtualPatchManager {
@@ -136,18 +192,94 @@ func NewVirtualPatchManager(engine *policy.Engine, blocker KernelBlocker, persis
 		persistPath: persistPath,
 	}
 	m.protectedPaths, m.protectedInodes = buildProtectedBinaryIndex("/etc/shells", nil)
+	if engine != nil {
+		engine.SetVirtualPatchExeGuard(m.IsProtectedExe)
+	}
+	m.syncProtectedToBlocker()
 	return m
+}
+
+func (m *VirtualPatchManager) syncProtectedToBlocker() {
+	ps, ok := m.blocker.(protectedExecSetter)
+	if !ok {
+		return
+	}
+	m.mu.RLock()
+	paths := make([]string, 0, len(m.protectedPaths))
+	for p := range m.protectedPaths {
+		paths = append(paths, p)
+	}
+	m.mu.RUnlock()
+	ps.SetProtectedExecPaths(paths)
+}
+
+// IsProtectedExe returns true if exe (or live /proc/<pid>/exe) matches any protected system
+// binary by canonical path, usrmerge alias, symlink target, or live (dev, ino) inode.
+// Used by policy.Engine to guarantee virtual patches can NEVER freeze or kill sshd, systemd,
+// login shells, apt/dpkg, or ringwalld (P0-A runtime invariant).
+func (m *VirtualPatchManager) IsProtectedExe(pid int, exe string) bool {
+	m.mu.RLock()
+	protPaths := m.protectedPaths
+	protInodes := m.protectedInodes
+	m.mu.RUnlock()
+
+	checkPath := func(raw string) bool {
+		raw = strings.TrimSpace(strings.TrimSuffix(raw, " (deleted)"))
+		if raw == "" {
+			return false
+		}
+		clean := filepath.ToSlash(filepath.Clean(raw))
+		if protPaths[clean] {
+			return true
+		}
+		for _, alias := range usrMergeAliases(clean) {
+			if protPaths[alias] {
+				return true
+			}
+		}
+		if resolved, err := filepath.EvalSymlinks(clean); err == nil {
+			rc := filepath.ToSlash(filepath.Clean(resolved))
+			if protPaths[rc] {
+				return true
+			}
+		}
+		if id, ok := statInodeID(clean); ok {
+			if _, hit := protInodes[id]; hit {
+				return true
+			}
+		}
+		return false
+	}
+
+	if checkPath(exe) {
+		return true
+	}
+	if pid > 0 {
+		procExe := fmt.Sprintf("/proc/%d/exe", pid)
+		if id, ok := statInodeID(procExe); ok {
+			if _, hit := protInodes[id]; hit {
+				return true
+			}
+		}
+		if target, err := os.Readlink(procExe); err == nil {
+			if checkPath(target) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // AddProtectedBinaryForTest registers an extra path (and its live inode) in the anti-lockout set.
 func (m *VirtualPatchManager) AddProtectedBinaryForTest(p string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	clean := filepath.ToSlash(filepath.Clean(p))
 	m.protectedPaths[clean] = true
 	if id, ok := statInodeID(clean); ok {
 		m.protectedInodes[id] = clean
 	}
+	m.mu.Unlock()
+	m.syncProtectedToBlocker()
 }
 
 func buildProtectedBinaryIndex(shellsPath string, extra []string) (map[string]bool, map[inodeID]string) {
@@ -167,6 +299,20 @@ func buildProtectedBinaryIndex(shellsPath string, extra []string) (map[string]bo
 	}
 	for _, p := range extra {
 		addPath(p)
+	}
+	// Dynamically include distro systemd and OpenSSH helper executables (P2-7).
+	for _, pat := range []string{
+		"/lib/systemd/systemd*",
+		"/usr/lib/systemd/systemd*",
+		"/usr/lib/openssh/*",
+		"/lib/openssh/*",
+		"/usr/libexec/openssh/*",
+	} {
+		if matches, err := filepath.Glob(pat); err == nil {
+			for _, m := range matches {
+				addPath(m)
+			}
+		}
 	}
 	if shellsPath != "" {
 		if f, err := os.Open(shellsPath); err == nil {
@@ -302,8 +448,8 @@ func validateVirtualPatchWithIndex(vp VirtualPatch, protPaths map[string]bool, p
 	return nil
 }
 
-// validateVirtualPatchGlob forbids '**' wildcards, root/top-level globs, and critical system prefixes,
-// requiring at least 3 fixed non-wildcard path components before any leaf wildcard.
+// validateVirtualPatchGlob forbids '**' wildcards, root/top-level globs, critical system/login prefixes,
+// SSH/shell startup dotfiles, and requires at least 3 fixed non-wildcard path components before any wildcard.
 func validateVirtualPatchGlob(vpID, raw string) error {
 	g := strings.TrimSpace(filepath.ToSlash(raw))
 	if !strings.HasPrefix(g, "/") || g == "/" {
@@ -319,6 +465,18 @@ func validateVirtualPatchGlob(vpID, raw string) error {
 		}
 	}
 	segs := strings.Split(strings.TrimPrefix(clean, "/"), "/")
+	isHomePath := len(segs) > 0 && segs[0] == "home"
+	for _, seg := range segs {
+		if seg == ".ssh" {
+			return fmt.Errorf("anti-lockout rejected: virtual patch %s cannot target .ssh path %q", vpID, raw)
+		}
+		if forbiddenLeafNames[seg] {
+			return fmt.Errorf("anti-lockout rejected: virtual patch %s cannot target login/shell file %q", vpID, raw)
+		}
+		if isHomePath && strings.HasPrefix(seg, ".") {
+			return fmt.Errorf("anti-lockout rejected: virtual patch %s cannot target user dotfile %q", vpID, raw)
+		}
+	}
 	fixedPrefix := 0
 	for _, seg := range segs {
 		if seg == "" || strings.ContainsAny(seg, "*?[") {
@@ -631,6 +789,22 @@ func (m *VirtualPatchManager) collectBlockedExecPathsLocked(now time.Time) []str
 			if m.protectedPaths[c] {
 				continue
 			}
+			// Re-verify live filesystem entry on EVERY sync so post-validation symlink swaps or
+			// hardlinks pointing to a protected binary can NEVER enter lsm_deny_exec_inodes (P1-B).
+			linfo, err := os.Lstat(c)
+			if err != nil || !linfo.Mode().IsRegular() {
+				continue
+			}
+			if resolved, rerr := filepath.EvalSymlinks(c); rerr == nil {
+				if m.protectedPaths[filepath.ToSlash(filepath.Clean(resolved))] {
+					continue
+				}
+			}
+			if id, ok := statInodeID(c); ok {
+				if _, hit := m.protectedInodes[id]; hit {
+					continue
+				}
+			}
 			if _, ok := seen[c]; !ok {
 				seen[c] = struct{}{}
 				out = append(out, c)
@@ -645,6 +819,9 @@ func (m *VirtualPatchManager) persist() error {
 	if m.persistPath == "" {
 		return nil
 	}
+	m.persistMu.Lock()
+	defer m.persistMu.Unlock()
+
 	pf := persistedVPFile{
 		Version: 1,
 		Patches: m.List(),
@@ -653,12 +830,18 @@ func (m *VirtualPatchManager) persist() error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(m.persistPath), 0o700); err != nil {
+	dir := filepath.Dir(m.persistPath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	tmp := m.persistPath + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	f, err := os.CreateTemp(dir, ".vpatches-*.tmp")
 	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
 		return err
 	}
 	if _, err := f.Write(append(data, '\n')); err != nil {
@@ -666,7 +849,6 @@ func (m *VirtualPatchManager) persist() error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	_ = f.Chmod(0o600)
 	if err := f.Sync(); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmp)

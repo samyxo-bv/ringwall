@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,10 +32,13 @@ func (f *fakeRunner) Run(_ context.Context, _ []string, name string, args ...str
 }
 
 type fakeKernelBlocker struct {
+	mu     sync.Mutex
 	synced []string
 }
 
 func (f *fakeKernelBlocker) SyncBlockedExecPaths(paths []string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.synced = append([]string(nil), paths...)
 	return len(paths), nil
 }
@@ -131,10 +135,78 @@ func TestVirtualPatchP0AntiLockoutSymlinksAliasesGlobsPortsAndAIKill(t *testing.
 		{ID: "VP-BAD-13", CVE: "CVE-13", TargetPorts: []uint16{443}, Source: "ai_assisted", Action: model.ActionBlockEgress, ExpiresAt: time.Now().Add(time.Hour)},
 		{ID: "VP-BAD-14", CVE: "CVE-14", TargetExePaths: []string{"/usr/sbin/vuln-httpd"}, Source: "ai_assisted", Action: model.ActionKill, ExpiresAt: time.Now().Add(time.Hour)},
 		{ID: "VP-BAD-15", CVE: "CVE-15", Action: model.ActionFreeze, ExpiresAt: time.Now().Add(time.Hour)}, // empty matchers
+		// P0-A & P2-7 regressions: login/shell/PAM/sudoers/root/home-dotfile globs & systemd/dbus binaries
+		{ID: "VP-BAD-16", CVE: "CVE-16", TargetPathGlobs: []string{"/root/.ssh/authorized_keys"}, Action: model.ActionFreeze, ExpiresAt: time.Now().Add(time.Hour)},
+		{ID: "VP-BAD-17", CVE: "CVE-17", TargetPathGlobs: []string{"/home/operator/.ssh/*"}, Action: model.ActionFreeze, ExpiresAt: time.Now().Add(time.Hour)},
+		{ID: "VP-BAD-18", CVE: "CVE-18", TargetPathGlobs: []string{"/home/operator/.ssh/authorized_keys"}, Action: model.ActionFreeze, ExpiresAt: time.Now().Add(time.Hour)},
+		{ID: "VP-BAD-19", CVE: "CVE-19", TargetPathGlobs: []string{"/home/operator/.profile"}, Action: model.ActionFreeze, ExpiresAt: time.Now().Add(time.Hour)},
+		{ID: "VP-BAD-20", CVE: "CVE-20", TargetPathGlobs: []string{"/home/operator/.bashrc"}, Action: model.ActionFreeze, ExpiresAt: time.Now().Add(time.Hour)},
+		{ID: "VP-BAD-21", CVE: "CVE-21", TargetPathGlobs: []string{"/etc/pam.d/sshd"}, Action: model.ActionFreeze, ExpiresAt: time.Now().Add(time.Hour)},
+		{ID: "VP-BAD-22", CVE: "CVE-22", TargetPathGlobs: []string{"/etc/sudoers.d/local"}, Action: model.ActionFreeze, ExpiresAt: time.Now().Add(time.Hour)},
+		{ID: "VP-BAD-23", CVE: "CVE-23", TargetExePaths: []string{"/usr/lib/systemd/systemd-executor"}, Action: model.ActionFreeze, ExpiresAt: time.Now().Add(time.Hour)},
+		{ID: "VP-BAD-24", CVE: "CVE-24", TargetExePaths: []string{"/usr/bin/dbus-daemon"}, Action: model.ActionFreeze, ExpiresAt: time.Now().Add(time.Hour)},
 	}
 	for _, bad := range badCases {
 		if _, err := mgr.Apply(bad); err == nil {
 			t.Errorf("P0 REGRESSION: anti-lockout MUST reject %s (%+v)", bad.ID, bad)
+		}
+	}
+
+	// P0-A RUNTIME INVARIANT: even a valid glob VP must NEVER match/freeze a protected system binary!
+	if _, err := mgr.Apply(VirtualPatch{
+		ID:              "VP-SAFE-GLOB",
+		CVE:             "CVE-2026-44444",
+		Package:         "custom-app",
+		TargetPathGlobs: []string{"/opt/app/data/*.cfg"},
+		Action:          model.ActionFreeze,
+		Source:          "ai_assisted",
+		ExpiresAt:       time.Now().UTC().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("Apply valid glob virtual patch: %v", err)
+	}
+	for _, protExe := range []string{"/usr/sbin/sshd", "/usr/lib/openssh/sshd-session", "/bin/bash", fakeBash} {
+		matches, act, _ := eng.Evaluate(model.Event{
+			Type: model.EventOpen,
+			Exe:  protExe,
+			Path: "/opt/app/data/app.cfg",
+		})
+		if len(matches) != 0 || act != model.ActionAllow {
+			t.Fatalf("P0-A REGRESSION: virtual patch matched protected exe %s: matches=%+v act=%s", protExe, matches, act)
+		}
+	}
+	if matches, act, _ := eng.Evaluate(model.Event{
+		Type: model.EventOpen,
+		Exe:  "/opt/app/bin/worker",
+		Path: "/opt/app/data/app.cfg",
+	}); len(matches) != 1 || act != model.ActionFreeze {
+		t.Fatalf("expected non-protected worker to match virtual patch, got matches=%+v act=%s", matches, act)
+	}
+
+	// P1-B SYMLINK-SWAP TOCTOU REGRESSION: replacing a VP target with a symlink to a protected binary
+	// after initial Apply MUST exclude that target on the next SyncBlockedExecPaths!
+	targetBin := filepath.Join(dir, "user-tool")
+	_ = os.WriteFile(targetBin, []byte("#!/bin/sh\n"), 0o755)
+	if _, err := mgr.Apply(VirtualPatch{
+		ID:             "VP-TOCTOU-TARGET",
+		CVE:            "CVE-2026-55555",
+		Package:        "user-tool",
+		TargetExePaths: []string{targetBin},
+		Action:         model.ActionFreeze,
+		Source:         "operator",
+		ExpiresAt:      time.Now().UTC().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("Apply VP-TOCTOU-TARGET: %v", err)
+	}
+	if len(blocker.synced) != 1 || blocker.synced[0] != filepath.ToSlash(targetBin) {
+		t.Fatalf("expected initial targetBin synced, got %+v", blocker.synced)
+	}
+	// Attacker replaces targetBin with symlink to protected fakeBash, then triggers another sync:
+	_ = os.Remove(targetBin)
+	_ = os.Symlink(fakeBash, targetBin)
+	mgr.Revoke("VP-SAFE-GLOB")
+	for _, s := range blocker.synced {
+		if s == filepath.ToSlash(targetBin) {
+			t.Fatalf("P1-B REGRESSION: symlink-swapped targetBin was still passed to SyncBlockedExecPaths: %+v", blocker.synced)
 		}
 	}
 }
@@ -142,6 +214,9 @@ func TestVirtualPatchP0AntiLockoutSymlinksAliasesGlobsPortsAndAIKill(t *testing.
 func TestVirtualPatchFailClosedReconcileAndRestartPersistence(t *testing.T) {
 	dir := t.TempDir()
 	storePath := filepath.Join(dir, "virtual-patches.json")
+	vulnBin := filepath.Join(dir, "vuln-httpd")
+	_ = os.WriteFile(vulnBin, []byte("#!/bin/sh\n"), 0o755)
+	vulnBinSlash := filepath.ToSlash(vulnBin)
 
 	eng1, _ := policy.NewEngine(nil)
 	blocker1 := &fakeKernelBlocker{}
@@ -151,7 +226,7 @@ func TestVirtualPatchFailClosedReconcileAndRestartPersistence(t *testing.T) {
 		ID:             "VP-CVE-2026-99999",
 		CVE:            "CVE-2026-99999",
 		Package:        "vuln-httpd",
-		TargetExePaths: []string{"/usr/sbin/vuln-httpd"},
+		TargetExePaths: []string{vulnBinSlash},
 		Action:         model.ActionFreeze,
 		Source:         "deterministic",
 		ExpiresAt:      time.Now().UTC().Add(24 * time.Hour),
@@ -182,10 +257,10 @@ func TestVirtualPatchFailClosedReconcileAndRestartPersistence(t *testing.T) {
 	if err != nil || n != 1 {
 		t.Fatalf("P1-4 REGRESSION: LoadPersisted failed: loaded=%d err=%v", n, err)
 	}
-	if len(blocker2.synced) != 1 || blocker2.synced[0] != "/usr/sbin/vuln-httpd" {
+	if len(blocker2.synced) != 1 || blocker2.synced[0] != vulnBinSlash {
 		t.Fatalf("P1-4 REGRESSION: kernel LSM exec blocker not restored after restart: %+v", blocker2.synced)
 	}
-	if matches, act, _ := eng2.Evaluate(model.Event{Type: model.EventExec, Exe: "/usr/sbin/vuln-httpd"}); len(matches) != 1 || act != model.ActionFreeze {
+	if matches, act, _ := eng2.Evaluate(model.Event{Type: model.EventExec, Exe: vulnBinSlash}); len(matches) != 1 || act != model.ActionFreeze {
 		t.Fatalf("P1-4 REGRESSION: policy rule not active after restart")
 	}
 	if !mgr2.Revoke("VP-CVE-2026-99999") {
@@ -195,12 +270,33 @@ func TestVirtualPatchFailClosedReconcileAndRestartPersistence(t *testing.T) {
 		t.Fatalf("expected kernel blocker cleared after Revoke, got %+v", blocker2.synced)
 	}
 
+	// P2-4 REGRESSION CHECK: concurrent Apply/Revoke persist calls must not race or corrupt JSON!
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			id := "VP-CONC-" + string(rune('A'+idx))
+			_, _ = mgr2.Apply(VirtualPatch{
+				ID:             id,
+				CVE:            "CVE-2026-77777",
+				Package:        "vuln-httpd",
+				TargetExePaths: []string{vulnBinSlash},
+				Action:         model.ActionFreeze,
+				Source:         "operator",
+				ExpiresAt:      time.Now().UTC().Add(time.Hour),
+			})
+			mgr2.Revoke(id)
+		}(i)
+	}
+	wg.Wait()
+
 	// Re-apply and verify Complete scan (0 errors, positive inventory, CVE resolved) DOES auto-revoke cleanly.
 	_, _ = mgr2.Apply(VirtualPatch{
 		ID:             "VP-CVE-2026-99999",
 		CVE:            "CVE-2026-99999",
 		Package:        "vuln-httpd",
-		TargetExePaths: []string{"/usr/sbin/vuln-httpd"},
+		TargetExePaths: []string{vulnBinSlash},
 		Action:         model.ActionFreeze,
 		Source:         "deterministic",
 		ExpiresAt:      time.Now().UTC().Add(24 * time.Hour),

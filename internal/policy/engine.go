@@ -65,6 +65,15 @@ type Engine struct {
 	rules        []Rule
 	virtualRules map[string]virtualRuleEntry
 	runtimeAllow []allowEntry
+	vpExeGuard   func(pid int, exe string) bool
+}
+
+// SetVirtualPatchExeGuard installs a runtime anti-lockout guard so virtual-patch rules can NEVER
+// match, freeze, or kill protected system binaries (sshd, systemd, shells, apt, ringwalld, etc.).
+func (e *Engine) SetVirtualPatchExeGuard(fn func(pid int, exe string) bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.vpExeGuard = fn
 }
 
 func NewEngine(rules []Rule) (*Engine, error) {
@@ -286,12 +295,14 @@ func (e *Engine) Evaluate(ev model.Event) ([]model.PolicyMatch, model.Action, mo
 	for i := range e.rules {
 		evalOne(&e.rules[i])
 	}
-	for _, ve := range e.virtualRules {
-		if !ve.expiresAt.IsZero() && !now.Before(ve.expiresAt) {
-			continue
+	if len(e.virtualRules) > 0 && (e.vpExeGuard == nil || !e.vpExeGuard(ev.PID, ev.Exe)) {
+		for _, ve := range e.virtualRules {
+			if !ve.expiresAt.IsZero() && !now.Before(ve.expiresAt) {
+				continue
+			}
+			r := ve.rule
+			evalOne(&r)
 		}
-		r := ve.rule
-		evalOne(&r)
 	}
 
 	return matches, action, severity

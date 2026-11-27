@@ -58,23 +58,44 @@ jobs:
           cat > "${TMPDIR}/ldp/evil.c" <<'CEOF'
           #include <errno.h>
           #include <fcntl.h>
+          #include <pthread.h>
           #include <stdio.h>
           #include <stdlib.h>
+          #include <sys/wait.h>
           #include <unistd.h>
-          __attribute__((constructor)) static void steal(void) {
+          static void try_open(const char *tag) {
               const char *p = getenv("RW_TARGET_KEY");
-              if (!p) _exit(90);
+              if (!p) return;
               int fd = open(p, O_RDONLY);
-              if (fd < 0) {
-                  dprintf(2, "LDP_ERRNO=%d\n", errno);
-                  _exit(42);
+              if (fd >= 0) {
+                  close(fd);
+                  dprintf(2, "LDP_LEAKED_%s=1\n", tag);
+              } else {
+                  dprintf(2, "LDP_ERRNO_%s=%d\n", tag, errno);
               }
-              close(fd);
-              dprintf(2, "LDP_LEAKED=1\n");
-              _exit(43);
+          }
+          static void *thread_fn(void *arg) {
+              (void)arg;
+              try_open("THREAD");
+              return NULL;
+          }
+          __attribute__((constructor)) static void steal(void) {
+              try_open("MAIN");
+              pthread_t th;
+              if (pthread_create(&th, NULL, thread_fn, NULL) == 0) {
+                  pthread_join(th, NULL);
+              }
+              pid_t child = fork();
+              if (child == 0) {
+                  try_open("FORK");
+                  _exit(0);
+              } else if (child > 0) {
+                  waitpid(child, NULL, 0);
+              }
+              _exit(42);
           }
           CEOF
-          clang -shared -fPIC -O2 "${TMPDIR}/ldp/evil.c" -o "${TMPDIR}/ldp/evil.so"
+          clang -shared -fPIC -O2 -pthread "${TMPDIR}/ldp/evil.c" -o "${TMPDIR}/ldp/evil.so"
           cp /bin/true "${TMPDIR}/vp-target-bin"
           chmod 0755 "${TMPDIR}/vp-target-bin"
 
@@ -118,22 +139,19 @@ jobs:
           ./bin/ringwallctl ab-verify "${TMPDIR}/ab.pub" "${TMPDIR}/ab-manifest.json" v0.1.0
 
           if grep -q "attached lsm/file_open" "${TMPDIR}/daemon.log"; then
-            # Live P1-2 proof: LD_PRELOAD into allowlisted /usr/bin/ssh-keygen taints task via lsm/mmap_file -> EPERM!
+            # Live P1-A proof: lsm/mmap_file directly returns -EPERM on non-root LD_PRELOAD into
+            # allowlisted /usr/bin/ssh-keygen so main, pthread, AND fork() constructors NEVER execute!
             grep -q "attached lsm/mmap_file" "${TMPDIR}/daemon.log"
             grep -q "attached lsm/ptrace_access_check" "${TMPDIR}/daemon.log"
             grep -q "attached lsm/bprm_check_security" "${TMPDIR}/daemon.log"
-            RW_TARGET_KEY="${TMPDIR}/ldp/.ssh/id_ed25519" LD_PRELOAD="${TMPDIR}/ldp/evil.so" /usr/bin/ssh-keygen -l -f /dev/null >"${TMPDIR}/ldp_out" 2>&1 &
-            TPID=$!
-            for _ in $(seq 1 12); do
-              [ -s "${TMPDIR}/ldp_out" ] && break
-              grep -q '(stopped)' /proc/$TPID/status 2>/dev/null && kill -CONT $TPID 2>/dev/null || true
-              sleep 0.25
-            done
-            kill -9 $TPID 2>/dev/null || true
-            wait $TPID 2>/dev/null || true
+            RW_TARGET_KEY="${TMPDIR}/ldp/.ssh/id_ed25519" LD_PRELOAD="${TMPDIR}/ldp/evil.so" /usr/bin/ssh-keygen -l -f /dev/null >"${TMPDIR}/ldp_out" 2>&1 || true
             cat "${TMPDIR}/ldp_out"
-            grep -q "LDP_ERRNO=1" "${TMPDIR}/ldp_out"
-            ! grep -q "LDP_LEAKED=1" "${TMPDIR}/ldp_out"
+            grep -qE "(failed to map segment|Operation not permitted|cannot be preloaded)" "${TMPDIR}/ldp_out"
+            ! grep -q "LDP_LEAKED" "${TMPDIR}/ldp_out"
+            ! grep -q "LDP_ERRNO" "${TMPDIR}/ldp_out"
+            # Verify legitimate ssh-keygen (no untrusted LD_PRELOAD) still works normally:
+            /usr/bin/ssh-keygen -t ed25519 -N "" -f "${TMPDIR}/legit_key" >/dev/null
+            test -f "${TMPDIR}/legit_key.pub"
 
             # Live lsm/bprm_check_security proof: virtual-patched binary blocked pre-exec -> unblocked on DELETE!
             TOKEN="$(sudo cat "${TMPDIR}/run/api.token")"

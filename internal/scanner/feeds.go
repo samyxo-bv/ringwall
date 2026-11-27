@@ -83,6 +83,7 @@ type osvBatchResp struct {
 		Vulns []struct {
 			ID string `json:"id"`
 		} `json:"vulns"`
+		NextPageToken string `json:"next_page_token,omitempty"`
 	} `json:"results"`
 }
 
@@ -123,6 +124,7 @@ func queryOSV(ctx context.Context, client *http.Client, baseURL string, pkgs []I
 	}
 	var hits []hit
 	uniqueIDs := make(map[string]struct{})
+	truncated := false
 
 	for start := 0; start < len(pkgs); start += batchSize {
 		end := start + batchSize
@@ -163,9 +165,15 @@ func queryOSV(ctx context.Context, client *http.Client, baseURL string, pkgs []I
 		if err := json.Unmarshal(body, &br); err != nil {
 			return nil, false, fmt.Errorf("decode OSV querybatch: %w", err)
 		}
+		if len(br.Results) != len(chunk) {
+			truncated = true
+		}
 		for i, res := range br.Results {
 			if i >= len(chunk) {
 				break
+			}
+			if res.NextPageToken != "" {
+				truncated = true
 			}
 			for _, v := range res.Vulns {
 				if v.ID == "" {
@@ -177,7 +185,7 @@ func queryOSV(ctx context.Context, client *http.Client, baseURL string, pkgs []I
 		}
 	}
 
-	// Deterministic sorted fetch order; mark truncated=true if capped so auto-revoke fails closed.
+	// Deterministic sorted fetch order; mark truncated=true if capped or paginated so auto-revoke fails closed.
 	sortedIDs := make([]string, 0, len(uniqueIDs))
 	for id := range uniqueIDs {
 		sortedIDs = append(sortedIDs, id)
@@ -185,8 +193,8 @@ func queryOSV(ctx context.Context, client *http.Client, baseURL string, pkgs []I
 	sort.Strings(sortedIDs)
 
 	const maxDetailFetch = 150
-	truncated := len(sortedIDs) > maxDetailFetch
-	if truncated {
+	if len(sortedIDs) > maxDetailFetch {
+		truncated = true
 		sortedIDs = sortedIDs[:maxDetailFetch]
 	}
 

@@ -2,9 +2,10 @@
 // Ringwall Linux eBPF LSM + tracing + tracepoint sensor (v0.2).
 // Tier 1 (kernels with BPF LSM active, e.g. Ringwall ISO):
 //   - lsm/file_open: FAIL-CLOSED synchronous -EPERM pre-read kernel blocking on SSH private keys &
-//     pinned secret inodes (computed BEFORE ringbuf reserve so ringbuf floods NEVER fail open).
-//   - lsm/mmap_file + BPF_MAP_TYPE_TASK_STORAGE: taints allowlisted ssh/ssh-keygen processes that
-//     map non-root-owned or world-writable PROT_EXEC objects (defeats LD_PRELOAD / PKCS11Provider).
+//     pinned secret inodes (computed BEFORE ringbuf reserve so ringbuf floods NEVER fail open);
+//     allowlisted SSH binaries lose exemption immediately if task->ptrace != 0 (defeats pre-exec strace).
+//   - lsm/mmap_file: FAIL-CLOSED synchronous -EPERM when an allowlisted SSH binary tries to mmap any
+//     non-root-owned or world-writable PROT_EXEC object (defeats LD_PRELOAD, PKCS11Provider, fork & threads).
 //   - lsm/ptrace_access_check: blocks non-root ptrace into allowlisted ssh processes.
 //   - lsm/bprm_check_security: synchronous -EPERM execution blocking for zero-day virtual-patched binaries.
 // Tier 2 (BTF kernels without lsm=...,bpf): fentry/security_file_open + bpf_d_path.
@@ -14,10 +15,6 @@
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
-
-#ifndef BPF_LOCAL_STORAGE_GET_F_CREATE
-#define BPF_LOCAL_STORAGE_GET_F_CREATE 1
-#endif
 
 #ifndef PROT_EXEC
 #define PROT_EXEC 0x4
@@ -60,6 +57,7 @@ struct mm_struct {
 } __attribute__((preserve_access_index));
 
 struct task_struct {
+    unsigned int ptrace;
     struct mm_struct *mm;
 } __attribute__((preserve_access_index));
 
@@ -166,15 +164,6 @@ struct {
     __type(key, struct file_key);
     __type(value, __u32);
 } allowed_ssh_exe_inodes SEC(".maps");
-
-// Per-task taint flag set by lsm/mmap_file when an allowlisted SSH binary loads a non-root or
-// world-writable PROT_EXEC object (defeats LD_PRELOAD & PKCS11Provider hijacks).
-struct {
-    __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
-    __uint(map_flags, BPF_F_NO_PREALLOC);
-    __type(key, int);
-    __type(value, __u32);
-} task_taint_map SEC(".maps");
 
 // Pinned secret file inodes (defeats hardlink & source-rename bypasses synchronously in lsm/file_open).
 struct {
@@ -285,9 +274,11 @@ static __always_inline int is_allowed_ssh_exe(void) {
     if (!is_task_exe_allowlisted(task)) {
         return 0;
     }
-    // Revoke exemption if process mapped any non-root or world-writable PROT_EXEC library (LD_PRELOAD / PKCS11).
-    __u32 *taint = bpf_task_storage_get(&task_taint_map, task, 0, 0);
-    if (taint && *taint != 0) {
+    // Revoke SSH key exemption if task is currently ptraced (defeats pre-exec strace / PTRACE_TRACEME
+    // even on hosts where yama.ptrace_scope <= 1).
+    unsigned int ptrace_flags = 0;
+    bpf_probe_read_kernel(&ptrace_flags, sizeof(ptrace_flags), __builtin_preserve_access_index(&task->ptrace));
+    if (ptrace_flags != 0) {
         return 0;
     }
     return 1;
@@ -668,15 +659,16 @@ int trace_lsm_file_open(__u64 *ctx) {
     return should_block ? -1 : 0;
 }
 
-// Tier 1: Taint allowlisted SSH binaries that mmap non-root or world-writable PROT_EXEC objects
-// (defeats LD_PRELOAD=~/x.so ssh-keygen and ssh -o PKCS11Provider=~/x.so hijacks).
+// Tier 1: Fail-closed block (-EPERM) when an allowlisted SSH binary tries to mmap any non-root or
+// world-writable PROT_EXEC object (defeats LD_PRELOAD, PKCS11Provider, fork(), and pthread_create()
+// before a single attacker instruction can execute).
 SEC("lsm/mmap_file")
 int trace_lsm_mmap_file(__u64 *ctx) {
     struct file *file = (struct file *)ctx[0];
     unsigned long reqprot = (unsigned long)ctx[1];
     unsigned long prot = (unsigned long)ctx[2];
     int ret = (int)ctx[4];
-    if (ret != 0 || !file || !((reqprot | prot) & PROT_EXEC)) {
+    if (ret != 0 || !file || !((reqprot | prot) & PROT_EXEC) || !is_lsm_enforce_enabled()) {
         return ret;
     }
     struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
@@ -693,11 +685,7 @@ int trace_lsm_mmap_file(__u64 *ctx) {
     bpf_probe_read_kernel(&owner_uid, sizeof(owner_uid), __builtin_preserve_access_index(&ino_p->i_uid.val));
     bpf_probe_read_kernel(&mode, sizeof(mode), __builtin_preserve_access_index(&ino_p->i_mode));
     if (owner_uid != 0 || (mode & 0002)) {
-        __u32 one = 1;
-        __u32 *slot = bpf_task_storage_get(&task_taint_map, task, &one, BPF_LOCAL_STORAGE_GET_F_CREATE);
-        if (slot) {
-            *slot = 1;
-        }
+        return -1; // -EPERM: refuse executable mapping of untrusted library into allowlisted SSH binary
     }
     return 0;
 }

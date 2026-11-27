@@ -35,18 +35,19 @@ type bpfFileKey struct {
 }
 
 type ebpfSensor struct {
-	coll           *ebpf.Collection
-	links          []link.Link
-	reader         *ringbuf.Reader
-	configMap      *ebpf.Map
-	statsMap       *ebpf.Map
-	denyExecMap    *ebpf.Map
-	openHook       string
-	lsmAttached    bool
-	lsmEnforce     atomic.Bool
-	execMapMu      sync.Mutex
-	pinnedExecKeys map[bpfFileKey]struct{}
-	chanDrops      atomic.Uint64
+	coll              *ebpf.Collection
+	links             []link.Link
+	reader            *ringbuf.Reader
+	configMap         *ebpf.Map
+	statsMap          *ebpf.Map
+	denyExecMap       *ebpf.Map
+	openHook          string
+	lsmAttached       bool
+	lsmEnforce        atomic.Bool
+	execMapMu         sync.Mutex
+	pinnedExecKeys    map[bpfFileKey]struct{}
+	protectedExecKeys map[bpfFileKey]struct{}
+	chanDrops         atomic.Uint64
 }
 
 func bpfLSMAvailable() bool {
@@ -71,6 +72,39 @@ func fileKeysForPath(p string) []bpfFileKey {
 	}
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok || st.Ino == 0 {
+		return nil
+	}
+	toKernelDev := func(rawDev uint64) uint32 {
+		return uint32((unix.Major(rawDev) << 20) | (unix.Minor(rawDev) & 0xfffff))
+	}
+	primary := bpfFileKey{Ino: st.Ino, Dev: toKernelDev(uint64(st.Dev))}
+	keys := []bpfFileKey{primary}
+
+	if dirInfo, derr := os.Stat(filepath.Dir(p)); derr == nil {
+		if dst, ok := dirInfo.Sys().(*syscall.Stat_t); ok {
+			ddev := toKernelDev(uint64(dst.Dev))
+			if ddev != primary.Dev {
+				keys = append(keys, bpfFileKey{Ino: st.Ino, Dev: ddev})
+			}
+		}
+	}
+	return keys
+}
+
+// regularFileKeysNoFollow atomically opens p with O_PATH|O_NOFOLLOW|O_CLOEXEC and Fstats the
+// exact opened inode, rejecting symlinks and non-regular files (closes P1-B symlink TOCTOU).
+func regularFileKeysNoFollow(p string) []bpfFileKey {
+	fd, err := unix.Open(p, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil
+	}
+	defer unix.Close(fd)
+
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return nil
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Ino == 0 {
 		return nil
 	}
 	toKernelDev := func(rawDev uint64) uint32 {
@@ -177,7 +211,6 @@ func newEBPFSensor(cfg config.SensorConfig) (Sensor, error) {
 		for _, p := range lsmProgs {
 			delete(spec.Programs, p)
 		}
-		delete(spec.Maps, "task_taint_map")
 	}
 
 	coll, err := ebpf.NewCollection(spec)
@@ -186,7 +219,6 @@ func newEBPFSensor(cfg config.SensorConfig) (Sensor, error) {
 		for _, p := range lsmProgs {
 			delete(spec.Programs, p)
 		}
-		delete(spec.Maps, "task_taint_map")
 		lsmReady = false
 		coll, err = ebpf.NewCollection(spec)
 	}
@@ -248,7 +280,7 @@ func newEBPFSensor(cfg config.SensorConfig) (Sensor, error) {
 				log.Printf("ringwall: optional lsm/mmap_file not attached: %v", attachErr)
 			} else {
 				links = append(links, l)
-				log.Printf("ringwall: attached lsm/mmap_file (LD_PRELOAD/PKCS11 taint guard active)")
+				log.Printf("ringwall: attached lsm/mmap_file (fail-closed LD_PRELOAD/PKCS11 -EPERM guard active)")
 			}
 		}
 		if prog := coll.Programs["trace_lsm_ptrace_access_check"]; prog != nil {
@@ -388,7 +420,22 @@ func (s *ebpfSensor) SetLSMEnforce(enabled bool) error {
 	return nil
 }
 
+// SetProtectedExecPaths records live (s_dev, i_ino) keys of protected system binaries so
+// SyncBlockedExecPaths physically refuses to insert any protected binary into lsm_deny_exec_inodes.
+func (s *ebpfSensor) SetProtectedExecPaths(paths []string) {
+	s.execMapMu.Lock()
+	defer s.execMapMu.Unlock()
+	next := make(map[bpfFileKey]struct{}, len(paths)*2)
+	for _, p := range paths {
+		for _, k := range fileKeysForPath(p) {
+			next[k] = struct{}{}
+		}
+	}
+	s.protectedExecKeys = next
+}
+
 // SyncBlockedExecPaths reconciles lsm_deny_exec_inodes with active zero-day virtual-patched executable paths.
+// Uses atomic O_PATH|O_NOFOLLOW + protected-inode filtering to defeat post-validation symlink swaps (P1-B).
 func (s *ebpfSensor) SyncBlockedExecPaths(paths []string) (int, error) {
 	if !s.lsmAttached || s.denyExecMap == nil {
 		return 0, nil
@@ -398,7 +445,18 @@ func (s *ebpfSensor) SyncBlockedExecPaths(paths []string) (int, error) {
 
 	desired := make(map[bpfFileKey]struct{})
 	for _, p := range paths {
-		for _, k := range fileKeysForPath(p) {
+		keys := regularFileKeysNoFollow(p)
+		protected := false
+		for _, k := range keys {
+			if _, hit := s.protectedExecKeys[k]; hit {
+				protected = true
+				break
+			}
+		}
+		if protected {
+			continue
+		}
+		for _, k := range keys {
 			desired[k] = struct{}{}
 		}
 	}

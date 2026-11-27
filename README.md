@@ -38,8 +38,8 @@ Ringwall ships a **step-by-step Setup Wizard** (`sudo ringwallctl setup` and the
 ```
   Linux Kernel — Tier 1 Fail-Closed Synchronous eBPF LSM
        │  • lsm/file_open: pre-read -EPERM on SSH keys & pinned secret inodes (fail-closed even under floods)
-       │  • lsm/mmap_file + lsm/ptrace_access_check: defeats LD_PRELOAD, PKCS11Provider & ptrace SSH hijacks
-       │  • lsm/bprm_check_security: pre-exec -EPERM on zero-day virtual-patched binaries
+       │  • lsm/mmap_file + lsm/ptrace_access_check + task->ptrace: blocks LD_PRELOAD/PKCS11/strace SSH hijacks
+       │  • lsm/bprm_check_security: pre-exec -EPERM on zero-day virtual-patched binaries (O_NOFOLLOW inode-safe)
        │  • Automatic fallback: fentry/security_file_open (bpf_d_path) -> syscall tracepoints -> procfs
        │  • 4 MiB ringbuf + per-CPU drop counter (RW-SYS-DROP) + exec/rename/link/symlink/connect/io_uring
        ▼
