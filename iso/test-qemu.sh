@@ -123,54 +123,61 @@ try:
     assert "AUDIT_DENIED" in out, f"P0 REGRESSION: operator must NOT read /var/log/ringwall/audit.jsonl:\n{out}"
     assert "API_STATUS=401" in out, f"P0 REGRESSION: unauthenticated API must return 401:\n{out}"
 
+    def assert_frozen(cmd_body: str, label: str):
+        # Poll up to 8s (0.5s steps) so cold-starting python3 under TCG emulation never races.
+        wrapped = (
+            f"{cmd_body} & TPID=$!; "
+            "for _ in $(seq 1 16); do "
+            "  P=$(pgrep -P $TPID python3 2>/dev/null || echo $TPID); "
+            "  grep -q 'T (stopped)' /proc/$P/status 2>/dev/null && break; "
+            "  sleep 0.5; "
+            "done; "
+            "P=$(pgrep -P $TPID python3 2>/dev/null || echo $TPID); "
+            "grep '^State:' /proc/$P/status; kill -9 $P $TPID 2>/dev/null || true"
+        )
+        out = run_cmd(wrapped)
+        assert "T (stopped)" in out, f"{label} was not frozen (T stopped), got:\n{out}"
+
     # 4. P1-C LIVE PROOF: io_uring_setup syscall (425) MUST be caught by eBPF and frozen!
-    out = run_cmd(
-        "python3 -c \"import ctypes, time; ctypes.CDLL(None).syscall(425, 1, ctypes.create_string_buffer(120)); time.sleep(25)\" & "
-        "UPID=$!; sleep 2; grep '^State:' /proc/$UPID/status; kill -9 $UPID 2>/dev/null || true"
+    assert_frozen(
+        'python3 -c "import ctypes, time; ctypes.CDLL(None).syscall(425, 1, ctypes.create_string_buffer(120)); time.sleep(25)"',
+        "P1-C io_uring_setup caller",
     )
-    assert "T (stopped)" in out, f"P1-C REGRESSION: io_uring_setup caller was not frozen (T stopped), got:\n{out}"
 
     # 5. Direct ~/.ssh/id_ed25519 read -> frozen via pidfd SIGSTOP
-    out = run_cmd(
-        "python3 -c \"open('/home/operator/.ssh/id_ed25519').read(); import time; time.sleep(25)\" & "
-        "APID=$!; sleep 2; grep '^State:' /proc/$APID/status; kill -9 $APID 2>/dev/null || true"
+    assert_frozen(
+        'python3 -c "open(\'/home/operator/.ssh/id_ed25519\').read(); import time; time.sleep(25)"',
+        "Direct SSH key reader",
     )
-    assert "T (stopped)" in out, f"Expected direct SSH key reader frozen (T stopped), got:\n{out}"
 
     # 6. P1-A LIVE PROOF 1: leading double-slash bypass //home/operator/.ssh/id_ed25519
-    out = run_cmd(
-        "python3 -c \"open('//home/operator/.ssh/id_ed25519').read(); import time; time.sleep(25)\" & "
-        "DPID=$!; sleep 2; grep '^State:' /proc/$DPID/status; kill -9 $DPID 2>/dev/null || true"
+    assert_frozen(
+        'python3 -c "open(\'//home/operator/.ssh/id_ed25519\').read(); import time; time.sleep(25)"',
+        "P1-A //home double-slash bypass",
     )
-    assert "T (stopped)" in out, f"P1-A REGRESSION: //home double-slash bypass not frozen, got:\n{out}"
 
     # 7. P1-A LIVE PROOF 2: /proc/self/cwd bypass after cd ~/.ssh
-    out = run_cmd(
-        "(cd /home/operator/.ssh && python3 -c \"open('/proc/self/cwd/id_ed25519').read(); import time; time.sleep(25)\") & "
-        "RPID=$!; sleep 2; CPID=$(pgrep -P $RPID python3 || echo $RPID); grep '^State:' /proc/$CPID/status; kill -9 $CPID $RPID 2>/dev/null || true"
+    assert_frozen(
+        '(cd /home/operator/.ssh && python3 -c "open(\'/proc/self/cwd/id_ed25519\').read(); import time; time.sleep(25)")',
+        "P1-A /proc/self/cwd bypass",
     )
-    assert "T (stopped)" in out, f"P1-A REGRESSION: /proc/self/cwd bypass not frozen, got:\n{out}"
 
     # 8. P1-A LIVE PROOF 3: directory symlink across PrivateTmp (ln -sfn ~/.ssh /tmp/d && open('/tmp/d/id_ed25519'))
-    out = run_cmd(
-        "ln -sfn /home/operator/.ssh /tmp/d; "
-        "python3 -c \"open('/tmp/d/id_ed25519').read(); import time; time.sleep(25)\" & "
-        "SPID=$!; sleep 2; grep '^State:' /proc/$SPID/status; kill -9 $SPID 2>/dev/null || true"
+    run_cmd("ln -sfn /home/operator/.ssh /tmp/d")
+    assert_frozen(
+        'python3 -c "open(\'/tmp/d/id_ed25519\').read(); import time; time.sleep(25)"',
+        "P1-A directory symlink /tmp/d/id_ed25519 bypass",
     )
-    assert "T (stopped)" in out, f"P1-A REGRESSION: directory symlink /tmp/d/id_ed25519 bypass not frozen, got:\n{out}"
 
     # 9. P1-B LIVE PROOFS: live reverse-shell bash AND recursive rm WITHOUT -f ('rm -r /usr')
-    out = run_cmd(
-        "bash -c 'echo /dev/tcp/198.51.100.42/4444 >/dev/null; sleep 25' & "
-        "BPID=$!; sleep 2; grep '^State:' /proc/$BPID/status; kill -9 $BPID 2>/dev/null || true"
+    assert_frozen(
+        "bash -c 'echo /dev/tcp/198.51.100.42/4444 >/dev/null; sleep 25'",
+        "Live reverse-shell bash",
     )
-    assert "T (stopped)" in out, f"Expected live reverse-shell bash frozen (T stopped), got:\n{out}"
-
-    out = run_cmd(
-        "bash -c 'rm -r /usr 2>/dev/null || sleep 25' & "
-        "MPID=$!; sleep 2; grep '^State:' /proc/$MPID/status; kill -9 $MPID 2>/dev/null || true"
+    assert_frozen(
+        "bash -c 'rm -r /usr 2>/dev/null || sleep 25'",
+        "P1-B recursive rm without -f",
     )
-    assert "T (stopped)" in out, f"P1-B REGRESSION: recursive rm without -f not frozen, got:\n{out}"
 
     # 10. Verify non-zero real incidents, 0 drops, and provider catalog works
     out = run_cmd("sleep 2; cat /run/ringwall-status/status.json && ringwallctl providers | grep -q 'Venice.ai' && echo PROVIDERS_OK")
