@@ -150,11 +150,12 @@ try:
 
     def assert_lsm_eperm(py_expr: str, label: str):
         # Proves synchronous kernel -EPERM BEFORE a single byte is read (0 bytes leaked!).
-        # Uses split sentinel markers and [ -s /tmp/lsm_out ] so TTY echo never collides with assertions.
+        # Uses split sentinel markers and a single atomic os.write(1, ...) so TTY echo never collides
+        # and polling [ -s /tmp/lsm_out ] can never race mid-line before errno is written under TCG load.
         wrapped = (
-            f'python3 -u -c "import os\ntry:\n {py_expr}\n print(\'LEAK_\' + \'DATA\')\nexcept OSError as e:\n print(\'BLK_\' + \'ERRNO:\', e.errno)" > /tmp/lsm_out 2>&1 & '
+            f'python3 -u -c "import os\ntry:\n {py_expr}\n os.write(1, (\'LEAK_\' + \'DATA\\n\').encode())\nexcept OSError as e:\n os.write(1, (\'BLK_\' + \'ERRNO: \' + str(e.errno) + \'\\n\').encode())" > /tmp/lsm_out 2>&1 & '
             "TPID=$!; "
-            "for _ in $(seq 1 12); do "
+            "for _ in $(seq 1 16); do "
             "  [ -s /tmp/lsm_out ] && break; "
             "  grep -q '(stopped)' /proc/$TPID/status 2>/dev/null && kill -CONT $TPID 2>/dev/null || true; "
             "  sleep 0.5; "
