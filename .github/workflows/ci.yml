@@ -156,9 +156,23 @@ jobs:
             listen_addr: 127.0.0.1:19443
             token_file: ${TMPDIR}/run/api.token
           EOF
-          sudo ./bin/ringwalld -config "${TMPDIR}/ringwall.yaml" 2>"${TMPDIR}/daemon.log" &
-          DPID=$!
-          trap "cat ${TMPDIR}/daemon.log || true; sudo kill $DPID 2>/dev/null || true; sleep 0.5; sudo rm -rf ${TMPDIR}; rm -f ${PWD}/.rw-ext4-vp-bin" EXIT
+          stop_pidfile() {
+            local pf="$1"
+            if [ -f "$pf" ]; then
+              local pid
+              pid="$(cat "$pf" 2>/dev/null || true)"
+              if [ -n "$pid" ]; then
+                sudo kill -TERM "$pid" 2>/dev/null || true
+                for _ in $(seq 1 25); do
+                  sudo kill -0 "$pid" 2>/dev/null || break
+                  sleep 0.2
+                done
+                sudo kill -KILL "$pid" 2>/dev/null || true
+              fi
+            fi
+          }
+          trap "cat ${TMPDIR}/daemon.log || true; cat ${TMPDIR}/daemon-optin.log 2>/dev/null || true; stop_pidfile ${TMPDIR}/ringwalld1.pid; stop_pidfile ${TMPDIR}/ringwalld2.pid; sudo rm -rf ${TMPDIR}; rm -f ${PWD}/.rw-ext4-vp-bin" EXIT
+          sudo bash -c "echo \$\$ > '${TMPDIR}/ringwalld1.pid'; exec ./bin/ringwalld -config '${TMPDIR}/ringwall.yaml'" 2>"${TMPDIR}/daemon.log" &
           for i in $(seq 1 20); do sudo test -f "${TMPDIR}/run/api.token" && break; sleep 0.5; done
           PERM="$(sudo stat -c '%a' "${TMPDIR}/run/api.token")"
           test "${PERM}" = "600"
@@ -239,12 +253,12 @@ jobs:
             "${TMPDIR}/vp-target-bin"
             "${PWD}/.rw-ext4-vp-bin"
 
-            # Stop default zero-exemption daemon, then verify opt-in allowlisted /usr/bin/ssh-keygen controls:
+            # Stop default zero-exemption daemon completely (verifying its exact PID exited & detached eBPF LSM),
+            # then verify opt-in allowlisted /usr/bin/ssh-keygen controls:
             # (1) positive control: untraced/untainted ssh-keygen CAN open decoy key (prints invalid format, NOT EPERM),
             # (2) LD_PRELOAD main+pthread+fork is blocked at ld.so map time by lsm/mmap_file,
             # (3) pre-exec PTRACE_TRACEME revokes exemption via task->ptrace != 0 -> EPERM!
-            sudo kill $DPID 2>/dev/null || true
-            sleep 0.5
+            stop_pidfile "${TMPDIR}/ringwalld1.pid"
             mkdir -p "${TMPDIR}/optin-policies"
             cp "${PWD}"/policies/*.yaml "${TMPDIR}/optin-policies/"
             python3 -c 'import sys; p=sys.argv[1]; s=open(p).read(); s=s.replace("        - '\''**/.ssh/*.pub'\''", "        - '\''**/.ssh/*.pub'\''\n      exclude_exe_paths:\n        - '\''/usr/bin/ssh-keygen'\''", 1); open(p,"w").write(s)' "${TMPDIR}/optin-policies/10-ai-agent-guard.yaml"
@@ -271,19 +285,18 @@ jobs:
             listen_addr: 127.0.0.1:19444
             token_file: ${TMPDIR}/run/api-optin.token
           EOF
-            sudo ./bin/ringwalld -config "${TMPDIR}/ringwall-optin.yaml" 2>"${TMPDIR}/daemon-optin.log" &
-            DPID=$!
+            sudo bash -c "echo \$\$ > '${TMPDIR}/ringwalld2.pid'; exec ./bin/ringwalld -config '${TMPDIR}/ringwall-optin.yaml'" 2>"${TMPDIR}/daemon-optin.log" &
             for i in $(seq 1 20); do sudo test -f "${TMPDIR}/run/api-optin.token" && break; sleep 0.5; done
             grep -q "allowed_ssh=1" "${TMPDIR}/daemon-optin.log"
 
             # Positive control (P2-g): untraced opt-in ssh-keygen opens decoy key (reaches key parser -> invalid format, NOT EPERM):
-            POS_OUT="$(/usr/bin/ssh-keygen -y -f "${TMPDIR}/ldp/.ssh/id_ed25519" </dev/null 2>&1 || true)"
+            POS_OUT="$(timeout 10 /usr/bin/ssh-keygen -y -f "${TMPDIR}/ldp/.ssh/id_ed25519" </dev/null 2>&1 || true)"
             echo "POSITIVE_CONTROL: ${POS_OUT}"
             echo "${POS_OUT}" | grep -qi "invalid format"
             ! echo "${POS_OUT}" | grep -qi "Operation not permitted"
 
             # Live P1-A proof on opt-in ssh-keygen: LD_PRELOAD blocked at ld.so map time (main/pthread/fork never run):
-            RW_TARGET_KEY="${TMPDIR}/ldp/.ssh/id_ed25519" LD_PRELOAD="${TMPDIR}/ldp/evil.so" /usr/bin/ssh-keygen -l -f /dev/null >"${TMPDIR}/ldp_out" 2>&1 || true
+            RW_TARGET_KEY="${TMPDIR}/ldp/.ssh/id_ed25519" LD_PRELOAD="${TMPDIR}/ldp/evil.so" timeout 10 /usr/bin/ssh-keygen -l -f /dev/null >"${TMPDIR}/ldp_out" 2>&1 || true
             cat "${TMPDIR}/ldp_out"
             grep -qE "(failed to map segment|Operation not permitted|cannot be preloaded)" "${TMPDIR}/ldp_out"
             ! grep -q "LDP_LEAKED" "${TMPDIR}/ldp_out"
@@ -296,6 +309,7 @@ jobs:
             cat "${TMPDIR}/pt_out"
             grep -qi "Operation not permitted" "${TMPDIR}/pt_out"
             ! grep -qi "invalid format" "${TMPDIR}/pt_out"
+            stop_pidfile "${TMPDIR}/ringwalld2.pid"
             echo "LIVE_LSM_ZERO_EXEMPT_OPTIN_PTRACE_MMAP_AND_BPRM_PROOFS_OK"
           fi
 
