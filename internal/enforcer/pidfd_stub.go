@@ -8,11 +8,17 @@ import (
 	"syscall"
 )
 
-var ErrPIDRecycled = errors.New("process start time changed; refusing to signal recycled PID")
+var (
+	ErrPIDRecycled      = errors.New("process start time changed; refusing to signal recycled PID")
+	ErrMissingStartTime = errors.New("process start time unknown (0); refusing unverified PID signal")
+)
 
 type osSignaler struct{}
 
-func (osSignaler) SignalVerified(pid int, _ uint64, sig syscall.Signal) error {
+func (osSignaler) SignalVerified(pid int, expectedStartTime uint64, sig syscall.Signal) error {
+	if expectedStartTime == 0 {
+		return ErrMissingStartTime
+	}
 	return syscall.Kill(pid, sig)
 }
 

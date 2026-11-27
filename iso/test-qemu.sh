@@ -3,15 +3,17 @@ set -euo pipefail
 
 # Headless QEMU live boot + real attack E2E verification for Ringwall ISO.
 # Proves inside the booted immutable ISO as strictly unprivileged monitored user 'operator':
-#  1. Boots cleanly with read-only SquashFS lower rootfs, no sshd, and io_uring disabled.
+#  1. Boots cleanly with read-only SquashFS lower rootfs and no sshd.
 #  2. Monitored user CANNOT read /run/ringwall/api.token (0600 root), CANNOT read audit.jsonl,
-#     and receives HTTP 401 from the control API (eliminating self-disable bypass).
+#     and receives HTTP 401 from the control API.
 #  3. ringwalld is active with live eBPF kernel sensor and 0 dropped events.
-#  4. Live direct SSH key read is caught by eBPF and frozen via pidfd SIGSTOP (State: T).
-#  5. Live bypass attempts (relative path 'cd ~/.ssh && open(id_ed25519)' AND symlink '/tmp/k')
-#     are canonicalized and frozen in kernel state T (stopped).
-#  6. Live execve attacks (bash reverse shell pattern AND 'rm -r -f -- /usr') are caught and frozen.
-#  7. Provider catalog is available and non-zero real incidents are recorded with 0 drops.
+#  4. Live io_uring_setup syscall (425) is caught by eBPF and frozen (State: T).
+#  5. Direct ~/.ssh/id_ed25519 read is frozen via pidfd SIGSTOP (State: T).
+#  6. Leading double-slash bypass (//home/operator/.ssh/id_ed25519) is frozen (State: T).
+#  7. /proc/self/cwd bypass (cd ~/.ssh && open('/proc/self/cwd/id_ed25519')) is frozen (State: T).
+#  8. Directory symlink bypass across PrivateTmp (ln -sfn ~/.ssh /tmp/d && open('/tmp/d/id_ed25519')) is frozen (State: T).
+#  9. Live execve attacks (bash reverse shell pattern AND 'rm -r /usr' without -f) are frozen (State: T).
+# 10. Provider catalog is available and real incidents are recorded with 0 drops.
 #
 # Usage: ./iso/test-qemu.sh dist/ringwall-appliance-amd64.iso
 
@@ -100,23 +102,18 @@ def run_cmd(shell_cmd: str, timeout: float = 45.0) -> str:
 try:
     boot_timeout = 240.0 if "-enable-kvm" not in kvm_args else 90.0
     read_until(b"operator@ringwall", boot_timeout)
-    print("\n[qemu-e2e] Boot complete! Running 8 live security assertions...\n", flush=True)
+    print("\n[qemu-e2e] Boot complete! Running 10 live security assertions...\n", flush=True)
 
-    # 1. Read-only SquashFS lower rootfs
-    out = run_cmd("mount | grep -E 'squashfs.*\\bro\\b'")
-    assert "squashfs" in out, f"Expected read-only squashfs mount, got:\n{out}"
+    # 1. Read-only SquashFS lower rootfs & no SSH server
+    out = run_cmd("mount | grep -E 'squashfs.*\\bro\\b' && test ! -x /usr/sbin/sshd && echo BASE_HARDENED_OK")
+    assert "BASE_HARDENED_OK" in out, f"Expected ro squashfs + no sshd, got:\n{out}"
 
-    # 2. No SSH server installed & io_uring disabled via sysctl
-    out = run_cmd("test ! -x /usr/sbin/sshd && echo NO_SSHD_OK; cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo NO_IOURING_SYSCTL")
-    assert "NO_SSHD_OK" in out, f"sshd must not be installed:\n{out}"
-    assert ("2" in out or "NO_IOURING_SYSCTL" in out), f"expected io_uring_disabled=2, got:\n{out}"
-
-    # 3. Wait for ringwalld public health snapshot and verify live eBPF sensor
+    # 2. Wait for ringwalld public health snapshot and verify live eBPF sensor
     out = run_cmd("for i in $(seq 1 30); do [ -r /run/ringwall-status/status.json ] && break; sleep 1; done; cat /run/ringwall-status/status.json", timeout=60.0)
     assert '"sensor_mode": "ebpf"' in out, f"Expected live eBPF sensor in ISO, got:\n{out}"
     assert '"policy_count": 0' not in out, f"Expected policies loaded, got:\n{out}"
 
-    # 4. P0-1 PROOF: monitored user 'operator' CANNOT read admin token or audit log and gets HTTP 401
+    # 3. P0-1 PROOF: monitored user 'operator' CANNOT read admin token or audit log and gets HTTP 401
     out = run_cmd(
         "(cat /run/ringwall/api.token 2>&1 || echo TOKEN_DENIED); "
         "(cat /var/log/ringwall/audit.jsonl 2>&1 || echo AUDIT_DENIED); "
@@ -126,28 +123,43 @@ try:
     assert "AUDIT_DENIED" in out, f"P0 REGRESSION: operator must NOT read /var/log/ringwall/audit.jsonl:\n{out}"
     assert "API_STATUS=401" in out, f"P0 REGRESSION: unauthenticated API must return 401:\n{out}"
 
-    # 5. LIVE ATTACK A: direct ~/.ssh/id_ed25519 read -> frozen by eBPF + pidfd SIGSTOP
+    # 4. P1-C LIVE PROOF: io_uring_setup syscall (425) MUST be caught by eBPF and frozen!
+    out = run_cmd(
+        "python3 -c \"import ctypes, time; ctypes.CDLL(None).syscall(425, 1, ctypes.create_string_buffer(120)); time.sleep(25)\" & "
+        "UPID=$!; sleep 2; grep '^State:' /proc/$UPID/status; kill -9 $UPID 2>/dev/null || true"
+    )
+    assert "T (stopped)" in out, f"P1-C REGRESSION: io_uring_setup caller was not frozen (T stopped), got:\n{out}"
+
+    # 5. Direct ~/.ssh/id_ed25519 read -> frozen via pidfd SIGSTOP
     out = run_cmd(
         "python3 -c \"open('/home/operator/.ssh/id_ed25519').read(); import time; time.sleep(25)\" & "
         "APID=$!; sleep 2; grep '^State:' /proc/$APID/status; kill -9 $APID 2>/dev/null || true"
     )
     assert "T (stopped)" in out, f"Expected direct SSH key reader frozen (T stopped), got:\n{out}"
 
-    # 6. LIVE ATTACK B (P1-2 BYPASSES): relative path (cd ~/.ssh && open('id_ed25519')) AND symlink (/tmp/k -> ~/.ssh/id_ed25519)
+    # 6. P1-A LIVE PROOF 1: leading double-slash bypass //home/operator/.ssh/id_ed25519
     out = run_cmd(
-        "(cd /home/operator/.ssh && python3 -c \"open('id_ed25519').read(); import time; time.sleep(25)\") & "
+        "python3 -c \"open('//home/operator/.ssh/id_ed25519').read(); import time; time.sleep(25)\" & "
+        "DPID=$!; sleep 2; grep '^State:' /proc/$DPID/status; kill -9 $DPID 2>/dev/null || true"
+    )
+    assert "T (stopped)" in out, f"P1-A REGRESSION: //home double-slash bypass not frozen, got:\n{out}"
+
+    # 7. P1-A LIVE PROOF 2: /proc/self/cwd bypass after cd ~/.ssh
+    out = run_cmd(
+        "(cd /home/operator/.ssh && python3 -c \"open('/proc/self/cwd/id_ed25519').read(); import time; time.sleep(25)\") & "
         "RPID=$!; sleep 2; CPID=$(pgrep -P $RPID python3 || echo $RPID); grep '^State:' /proc/$CPID/status; kill -9 $CPID $RPID 2>/dev/null || true"
     )
-    assert "T (stopped)" in out, f"Expected relative-path SSH bypass frozen (T stopped), got:\n{out}"
+    assert "T (stopped)" in out, f"P1-A REGRESSION: /proc/self/cwd bypass not frozen, got:\n{out}"
 
+    # 8. P1-A LIVE PROOF 3: directory symlink across PrivateTmp (ln -sfn ~/.ssh /tmp/d && open('/tmp/d/id_ed25519'))
     out = run_cmd(
-        "ln -sf /home/operator/.ssh/id_ed25519 /tmp/k; "
-        "python3 -c \"open('/tmp/k').read(); import time; time.sleep(25)\" & "
+        "ln -sfn /home/operator/.ssh /tmp/d; "
+        "python3 -c \"open('/tmp/d/id_ed25519').read(); import time; time.sleep(25)\" & "
         "SPID=$!; sleep 2; grep '^State:' /proc/$SPID/status; kill -9 $SPID 2>/dev/null || true"
     )
-    assert "T (stopped)" in out, f"Expected symlink SSH bypass frozen (T stopped), got:\n{out}"
+    assert "T (stopped)" in out, f"P1-A REGRESSION: directory symlink /tmp/d/id_ed25519 bypass not frozen, got:\n{out}"
 
-    # 7. LIVE ATTACK C (P1-3 REAL EXECVE): reverse shell pattern AND destructive rm -r -f -- /usr
+    # 9. P1-B LIVE PROOFS: live reverse-shell bash AND recursive rm WITHOUT -f ('rm -r /usr')
     out = run_cmd(
         "bash -c 'echo /dev/tcp/198.51.100.42/4444 >/dev/null; sleep 25' & "
         "BPID=$!; sleep 2; grep '^State:' /proc/$BPID/status; kill -9 $BPID 2>/dev/null || true"
@@ -155,18 +167,18 @@ try:
     assert "T (stopped)" in out, f"Expected live reverse-shell bash frozen (T stopped), got:\n{out}"
 
     out = run_cmd(
-        "bash -c 'rm -r -f -- /usr 2>/dev/null || sleep 25' & "
+        "bash -c 'rm -r /usr 2>/dev/null || sleep 25' & "
         "MPID=$!; sleep 2; grep '^State:' /proc/$MPID/status; kill -9 $MPID 2>/dev/null || true"
     )
-    assert "T (stopped)" in out, f"Expected live destructive rm bypass frozen (T stopped), got:\n{out}"
+    assert "T (stopped)" in out, f"P1-B REGRESSION: recursive rm without -f not frozen, got:\n{out}"
 
-    # 8. Verify non-zero incidents recorded, 0 drops, and provider catalog works
+    # 10. Verify non-zero real incidents, 0 drops, and provider catalog works
     out = run_cmd("sleep 2; cat /run/ringwall-status/status.json && ringwallctl providers | grep -q 'Venice.ai' && echo PROVIDERS_OK")
     assert '"dropped_events": 0' in out, f"Expected 0 dropped events, got:\n{out}"
     assert '"incidents_total": 0' not in out, f"Expected real incidents recorded, got:\n{out}"
     assert "PROVIDERS_OK" in out, f"Provider catalog missing:\n{out}"
 
-    print("\n[qemu-e2e] ALL 8 LIVE ISO SECURITY ASSERTIONS PASSED!\n", flush=True)
+    print("\n[qemu-e2e] ALL 10 LIVE ISO SECURITY ASSERTIONS PASSED!\n", flush=True)
 finally:
     proc.terminate()
     try:

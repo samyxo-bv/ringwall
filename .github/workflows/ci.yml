@@ -34,7 +34,7 @@ jobs:
       - name: Run go vet and full race test suite
         run: |
           go vet -mod=readonly ./...
-          go test -mod=readonly -race -v ./...
+          go test -count=1 -mod=readonly -race -v ./...
 
       - name: Build static Linux binaries with embedded eBPF
         run: |
@@ -117,7 +117,7 @@ jobs:
       - name: Build hardened immutable bootable ISO
         run: sudo ./iso/build-iso.sh --out dist/ringwall-appliance-amd64.iso
 
-      - name: Boot ISO in QEMU & verify 8 live security assertions
+      - name: Boot ISO in QEMU & verify 10 live security assertions
         run: ./iso/test-qemu.sh dist/ringwall-appliance-amd64.iso
 
       - name: Upload verified bootable ISO

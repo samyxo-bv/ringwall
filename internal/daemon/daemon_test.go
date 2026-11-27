@@ -75,7 +75,7 @@ func TestOperatorDecisionCannotBeOverwrittenBySlowAI(t *testing.T) {
 	}
 
 	pol, _ := policy.NewEngine([]policy.Rule{{
-		ID: "RW-WARN-1", Name: "Suspicious open", Severity: model.SeverityMedium, Action: model.ActionWarn,
+		ID: "RW-FREEZE-1", Name: "Suspicious open", Severity: model.SeverityHigh, Action: model.ActionFreeze,
 		Match: policy.MatchSpec{EventTypes: []model.EventType{model.EventOpen}, PathGlobs: []string{"/tmp/watch"}},
 	}})
 	alog, _ := audit.Open(cfg.AuditLogPath)
@@ -86,8 +86,8 @@ func TestOperatorDecisionCannotBeOverwrittenBySlowAI(t *testing.T) {
 	inc := d.ProcessEvent(context.Background(), model.Event{
 		Type: model.EventOpen, PID: 8888, StartTime: 1001, Comm: "python3", Exe: "/usr/bin/python3", Path: "/tmp/watch",
 	}, false)
-	if inc == nil {
-		t.Fatalf("expected incident to be created")
+	if inc == nil || inc.Status != model.StatusFrozen {
+		t.Fatalf("expected frozen incident, got %+v", inc)
 	}
 
 	// Operator resumes/approves BEFORE slow AI responds.
@@ -101,7 +101,7 @@ func TestOperatorDecisionCannotBeOverwrittenBySlowAI(t *testing.T) {
 		t.Fatalf("expected kill on already-finalized incident to be rejected")
 	}
 
-	// Now let slow AI finish; it MUST NOT overwrite StatusAllowed or send SIGSTOP/SIGKILL!
+	// Now let slow AI finish; it MUST NOT overwrite StatusAllowed or send SIGKILL!
 	close(releaseAI)
 	time.Sleep(150 * time.Millisecond)
 
@@ -112,7 +112,7 @@ func TestOperatorDecisionCannotBeOverwrittenBySlowAI(t *testing.T) {
 	sig.mu.Lock()
 	defer sig.mu.Unlock()
 	for _, s := range sig.calls {
-		if s == syscall.SIGSTOP || s == syscall.SIGKILL {
+		if s == syscall.SIGKILL {
 			t.Fatalf("slow AI illegally sent %v after operator decision", s)
 		}
 	}

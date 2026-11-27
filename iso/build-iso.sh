@@ -92,7 +92,7 @@ chroot "${CHROOT}" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get install -
   procps \
   kmod \
   dbus \
-  python3-minimal \
+  python3 \
   netcat-openbsd \
   curl
 

@@ -28,8 +28,8 @@ func TestDecodeRawEventExec(t *testing.T) {
 	if err := binary.Write(&buf, binary.LittleEndian, &raw); err != nil {
 		t.Fatalf("binary.Write: %v", err)
 	}
-	if buf.Len() != 1280 {
-		t.Fatalf("expected 1280-byte raw struct matching ringwall.bpf.c, got %d", buf.Len())
+	if buf.Len() != 1344 {
+		t.Fatalf("expected 1344-byte raw struct matching ringwall.bpf.c, got %d", buf.Len())
 	}
 
 	ev, err := DecodeRawEvent(buf.Bytes(), time.Unix(1700000000, 0))

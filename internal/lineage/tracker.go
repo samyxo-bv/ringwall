@@ -20,13 +20,17 @@ const (
 	atFDCWD         = -100
 )
 
-var procRootPrefixRe = regexp.MustCompile(`^/proc/(?:self|thread-self|[0-9]+)/root(/|$)`)
+var (
+	procRootPrefixRe = regexp.MustCompile(`^/proc/(?:self|thread-self|[0-9]+)/root(/|$)`)
+	procCwdPrefixRe  = regexp.MustCompile(`^/proc/(?:self|thread-self|[0-9]+)/cwd(/|$)`)
+	procFDPrefixRe   = regexp.MustCompile(`^(?:/proc/(?:self|thread-self|[0-9]+)/fd|/dev/fd)/([0-9]+)(/|$)`)
+)
 
 // ProcReader abstracts /proc lookups for testability.
 type ProcReader interface {
 	ReadProcess(pid int) (model.ProcessInfo, bool)
 	ReadFDPath(pid int, fd int32) (string, bool)
-	EvalSymlinks(pid int, path string) string
+	ReadLink(pid int, path string) (string, bool)
 }
 
 type linuxProcReader struct{}
@@ -82,38 +86,68 @@ func (linuxProcReader) ReadFDPath(pid int, fd int32) (string, bool) {
 	return p, true
 }
 
-func (linuxProcReader) EvalSymlinks(pid int, path string) string {
-	// Resolve symlinks inside the target process's mount namespace via /proc/<pid>/root
-	// so PrivateTmp=yes and container mount namespaces never hide /tmp/* symlinks.
-	if pid > 0 && strings.HasPrefix(path, "/") {
-		cur := cleanSlashPath(path)
-		for hop := 0; hop < 8; hop++ {
-			target, err := os.Readlink(fmt.Sprintf("/proc/%d/root%s", pid, cur))
-			if err != nil {
-				break
-			}
-			if strings.HasPrefix(target, "/") {
-				cur = cleanSlashPath(target)
-			} else {
-				dir := cur[:strings.LastIndexByte(cur, '/')]
-				if dir == "" {
-					dir = "/"
-				}
-				cur = cleanSlashPath(dir + "/" + target)
-			}
-		}
-		if cur != cleanSlashPath(path) {
-			return cur
+// ReadLink inspects a single path component inside the target PID's mount namespace via /proc/<pid>/root,
+// defeating PrivateTmp=yes and container mount namespace isolation.
+func (linuxProcReader) ReadLink(pid int, path string) (string, bool) {
+	if !strings.HasPrefix(path, "/") {
+		return "", false
+	}
+	if pid > 0 {
+		if target, err := os.Readlink(fmt.Sprintf("/proc/%d/root%s", pid, path)); err == nil {
+			return target, true
 		}
 	}
-	resolved, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		return path
+	if target, err := os.Readlink(path); err == nil {
+		return target, true
 	}
-	return resolved
+	return "", false
 }
 
-// ParseProcStat parses comm, ppid, and starttime (field 22) from /proc/<pid>/stat.
+// ResolveSymlinksComponentWise walks every prefix of path left-to-right (up to 16 symlink hops),
+// catching both leaf symlinks (/tmp/k) and directory symlinks (ln -s ~/.ssh /tmp/d; cat /tmp/d/id_ed25519).
+func ResolveSymlinksComponentWise(path string, readlink func(string) (string, bool)) string {
+	if readlink == nil || !strings.HasPrefix(path, "/") {
+		return path
+	}
+	cur := cleanSlashPath(path)
+	for hop := 0; hop < 16; hop++ {
+		segs := strings.Split(strings.TrimPrefix(cur, "/"), "/")
+		prefix := ""
+		replaced := false
+		for i, seg := range segs {
+			if seg == "" {
+				continue
+			}
+			prefix += "/" + seg
+			target, ok := readlink(prefix)
+			if !ok {
+				continue
+			}
+			rest := strings.Join(segs[i+1:], "/")
+			var next string
+			if strings.HasPrefix(target, "/") {
+				next = target
+			} else {
+				parent := prefix[:strings.LastIndexByte(prefix, '/')]
+				if parent == "" {
+					parent = "/"
+				}
+				next = parent + "/" + target
+			}
+			if rest != "" {
+				next = strings.TrimRight(next, "/") + "/" + rest
+			}
+			cur = cleanSlashPath(next)
+			replaced = true
+			break
+		}
+		if !replaced {
+			break
+		}
+	}
+	return cur
+}
+
 func ParseProcStat(stat string) (comm string, ppid int, startTime uint64) {
 	openIdx := strings.IndexByte(stat, '(')
 	closeIdx := strings.LastIndexByte(stat, ')')
@@ -122,7 +156,6 @@ func ParseProcStat(stat string) (comm string, ppid int, startTime uint64) {
 	}
 	comm = stat[openIdx+1 : closeIdx]
 	rest := strings.Fields(stat[closeIdx+2:])
-	// rest[0] is field 3 (state), rest[1] is field 4 (ppid), rest[19] is field 22 (starttime).
 	if len(rest) >= 2 {
 		ppid, _ = strconv.Atoi(rest[1])
 	}
@@ -147,7 +180,6 @@ func parseUIDFromStatus(status string) uint32 {
 	return 0
 }
 
-// ReadProcessStartTime reads field 22 (starttime) of /proc/<pid>/stat for PID-reuse verification.
 func ReadProcessStartTime(pid int) (uint64, bool) {
 	if pid <= 0 {
 		return 0, false
@@ -160,9 +192,9 @@ func ReadProcessStartTime(pid int) (uint64, bool) {
 	return st, st > 0
 }
 
-// CanonicalizePath normalizes /etc//shadow, /etc/./shadow, /proc/<pid|self>/root/...,
-// relative paths (via dirfd or cwd), and symlinks so path-based policy bypasses cannot evade rules.
-func CanonicalizePath(rawPath string, dirfd int32, cwd string, fdResolver func(int32) (string, bool), evalSymlinks func(string) string) string {
+// CanonicalizePath normalizes //home, /./home, /proc/<pid|self>/(root|cwd|fd), /dev/fd/<n>,
+// relative paths (via dirfd or cwd), and component-wise directory/file symlinks.
+func CanonicalizePath(rawPath string, dirfd int32, cwd string, fdResolver func(int32) (string, bool), readlink func(string) (string, bool)) string {
 	if rawPath == "" {
 		return ""
 	}
@@ -185,24 +217,45 @@ func CanonicalizePath(rawPath string, dirfd int32, cwd string, fdResolver func(i
 
 	p = cleanSlashPath(p)
 
-	// Strip /proc/self/root/..., /proc/thread-self/root/..., or /proc/<pid>/root/... prefixes (repeatedly).
+	// Expand /proc/<pid|self>/(root|cwd|fd) and /dev/fd/<n> prefixes (up to 4 nested passes).
 	for i := 0; i < 4; i++ {
-		if !procRootPrefixRe.MatchString(p) {
+		changed := false
+		if procRootPrefixRe.MatchString(p) {
+			p = cleanSlashPath(procRootPrefixRe.ReplaceAllString(p, "/"))
+			changed = true
+		}
+		if cwd != "" && procCwdPrefixRe.MatchString(p) {
+			base := strings.TrimRight(filepath.ToSlash(cwd), "/")
+			p = cleanSlashPath(procCwdPrefixRe.ReplaceAllString(p, base+"/"))
+			changed = true
+		}
+		if fdResolver != nil {
+			if m := procFDPrefixRe.FindStringSubmatchIndex(p); m != nil {
+				fdNumStr := p[m[2]:m[3]]
+				if fdNum, err := strconv.Atoi(fdNumStr); err == nil {
+					if resolvedDir, ok := fdResolver(int32(fdNum)); ok {
+						rest := p[m[1]:]
+						base := strings.TrimRight(filepath.ToSlash(resolvedDir), "/")
+						if rest != "" {
+							p = cleanSlashPath(base + "/" + rest)
+						} else {
+							p = cleanSlashPath(base)
+						}
+						changed = true
+					}
+				}
+			}
+		}
+		if !changed {
 			break
 		}
-		p = procRootPrefixRe.ReplaceAllString(p, "/")
-		p = cleanSlashPath(p)
 	}
 
-	if evalSymlinks != nil && strings.HasPrefix(p, "/") {
-		if sym := evalSymlinks(p); sym != "" {
-			p = cleanSlashPath(filepath.ToSlash(sym))
-			for i := 0; i < 2; i++ {
-				if !procRootPrefixRe.MatchString(p) {
-					break
-				}
-				p = procRootPrefixRe.ReplaceAllString(p, "/")
-				p = cleanSlashPath(p)
+	if readlink != nil && strings.HasPrefix(p, "/") {
+		p = ResolveSymlinksComponentWise(p, readlink)
+		for i := 0; i < 2; i++ {
+			if procRootPrefixRe.MatchString(p) {
+				p = cleanSlashPath(procRootPrefixRe.ReplaceAllString(p, "/"))
 			}
 		}
 	}
@@ -211,7 +264,6 @@ func CanonicalizePath(rawPath string, dirfd int32, cwd string, fdResolver func(i
 }
 
 func cleanSlashPath(p string) string {
-	// Manual POSIX clean so Windows unit tests also preserve leading '/' cleanly.
 	isAbs := strings.HasPrefix(p, "/")
 	parts := strings.Split(p, "/")
 	stack := make([]string, 0, len(parts))
@@ -285,7 +337,6 @@ func (t *Tracker) lookup(pid int) (model.ProcessInfo, bool) {
 	return cached, ok
 }
 
-// Enrich populates process metadata, start time, canonical file path, and full ancestry.
 func (t *Tracker) Enrich(ev *model.Event) {
 	if ev == nil || ev.PID <= 0 {
 		return
@@ -306,7 +357,8 @@ func (t *Tracker) Enrich(ev *model.Event) {
 		if ev.Exe == "" {
 			ev.Exe = live.Exe
 		}
-		if ev.Cmdline == "" {
+		// Prefer fuller /proc/<pid>/cmdline when eBPF argv was truncated (e.g. > 8 args).
+		if live.Cmdline != "" && (ev.Cmdline == "" || len(live.Cmdline) > len(ev.Cmdline)) {
 			ev.Cmdline = live.Cmdline
 		}
 		if ev.UID == 0 && live.UID != 0 {
@@ -314,6 +366,7 @@ func (t *Tracker) Enrich(ev *model.Event) {
 		}
 	}
 
+	rl := func(p string) (string, bool) { return t.reader.ReadLink(ev.PID, p) }
 	if ev.Path != "" {
 		ev.RawPath = ev.Path
 		ev.Path = CanonicalizePath(
@@ -321,11 +374,11 @@ func (t *Tracker) Enrich(ev *model.Event) {
 			ev.DirFD,
 			cwd,
 			func(fd int32) (string, bool) { return t.reader.ReadFDPath(ev.PID, fd) },
-			func(p string) string { return t.reader.EvalSymlinks(ev.PID, p) },
+			rl,
 		)
 	}
 	if ev.Exe != "" {
-		ev.Exe = CanonicalizePath(ev.Exe, atFDCWD, cwd, nil, func(p string) string { return t.reader.EvalSymlinks(ev.PID, p) })
+		ev.Exe = CanonicalizePath(ev.Exe, atFDCWD, cwd, nil, rl)
 	}
 
 	t.Record(model.ProcessInfo{

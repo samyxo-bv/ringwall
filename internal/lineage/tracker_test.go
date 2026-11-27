@@ -27,11 +27,11 @@ func (f *fakeProcReader) ReadFDPath(pid int, fd int32) (string, bool) {
 	return "", false
 }
 
-func (f *fakeProcReader) EvalSymlinks(_ int, path string) string {
+func (f *fakeProcReader) ReadLink(_ int, path string) (string, bool) {
 	if s, ok := f.symlinks[path]; ok {
-		return s
+		return s, true
 	}
-	return path
+	return "", false
 }
 
 func TestCanonicalizePathDefeatsAllBypasses(t *testing.T) {
@@ -45,6 +45,7 @@ func TestCanonicalizePathDefeatsAllBypasses(t *testing.T) {
 		},
 		symlinks: map[string]string{
 			"/tmp/k": "/home/alice/.ssh/id_ed25519",
+			"/tmp/d": "/home/alice/.ssh",
 		},
 	}
 	tr := NewTracker(fr)
@@ -57,9 +58,15 @@ func TestCanonicalizePathDefeatsAllBypasses(t *testing.T) {
 	}{
 		{"proc self root traversal", "/proc/self/root/home/alice/.ssh/id_rsa", -100, "/home/alice/.ssh/id_rsa"},
 		{"proc pid root traversal", "/proc/100/root/etc/shadow", -100, "/etc/shadow"},
+		{"proc self cwd traversal", "/proc/self/cwd/id_ed25519", -100, "/home/alice/.ssh/id_ed25519"},
+		{"dev fd traversal", "/dev/fd/7/id_ed25519", -100, "/home/alice/.ssh/id_ed25519"},
+		{"proc self fd traversal", "/proc/self/fd/7/id_ed25519", -100, "/home/alice/.ssh/id_ed25519"},
+		{"leading double slash", "//home/alice/.ssh/id_ed25519", -100, "/home/alice/.ssh/id_ed25519"},
+		{"leading dot slash", "/./home/alice/.ssh/id_ed25519", -100, "/home/alice/.ssh/id_ed25519"},
 		{"relative path via cwd", "id_rsa", -100, "/home/alice/.ssh/id_rsa"},
 		{"relative path via openat dirfd", "id_ed25519", 7, "/home/alice/.ssh/id_ed25519"},
-		{"symlink bypass", "/tmp/k", -100, "/home/alice/.ssh/id_ed25519"},
+		{"leaf symlink bypass", "/tmp/k", -100, "/home/alice/.ssh/id_ed25519"},
+		{"directory symlink bypass", "/tmp/d/id_ed25519", -100, "/home/alice/.ssh/id_ed25519"},
 		{"double slash normalization", "/etc//shadow", -100, "/etc/shadow"},
 		{"dot segment normalization", "/etc/./shadow", -100, "/etc/shadow"},
 	}
@@ -85,7 +92,7 @@ func TestTrackerConcurrentEnrichAndCycleSafe(t *testing.T) {
 	fr := &fakeProcReader{
 		procs: map[int]model.ProcessInfo{
 			10: {PID: 10, PPID: 20, Comm: "a"},
-			20: {PID: 20, PPID: 10, Comm: "b"}, // cycle!
+			20: {PID: 20, PPID: 10, Comm: "b"},
 		},
 	}
 	tr := NewTracker(fr)
@@ -93,14 +100,14 @@ func TestTrackerConcurrentEnrichAndCycleSafe(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := 0; i < 32; i++ {
 		wg.Add(1)
-		go func(id int) {
+		go func() {
 			defer wg.Done()
 			ev := model.Event{Type: model.EventExec, PID: 10, Path: "/usr/bin/id"}
 			tr.Enrich(&ev)
 			if len(ev.Ancestry) > 2 {
 				t.Errorf("cycle guard failed: ancestry len %d", len(ev.Ancestry))
 			}
-		}(i)
+		}()
 	}
 	wg.Wait()
 }

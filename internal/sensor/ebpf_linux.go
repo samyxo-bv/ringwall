@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"sync/atomic"
 	"time"
@@ -80,8 +81,11 @@ func newEBPFSensor(cfg config.SensorConfig) (Sensor, error) {
 		{prog: "trace_openat", group: "syscalls", name: "sys_enter_openat"},
 		{prog: "trace_openat2", group: "syscalls", name: "sys_enter_openat2", optional: true},
 		{prog: "trace_open", group: "syscalls", name: "sys_enter_open", optional: true},
+		{prog: "trace_creat", group: "syscalls", name: "sys_enter_creat", optional: true},
+		{prog: "trace_renameat2", group: "syscalls", name: "sys_enter_renameat2", optional: true},
 		{prog: "trace_connect", group: "syscalls", name: "sys_enter_connect"},
 		{prog: "trace_sendto", group: "syscalls", name: "sys_enter_sendto", optional: true},
+		{prog: "trace_io_uring_setup", group: "syscalls", name: "sys_enter_io_uring_setup", optional: true},
 	}
 
 	links := make([]link.Link, 0, len(specs))
@@ -89,6 +93,7 @@ func newEBPFSensor(cfg config.SensorConfig) (Sensor, error) {
 		prog := coll.Programs[s.prog]
 		if prog == nil {
 			if s.optional {
+				log.Printf("ringwall: optional bpf program %q absent", s.prog)
 				continue
 			}
 			cleanup(links)
@@ -97,6 +102,7 @@ func newEBPFSensor(cfg config.SensorConfig) (Sensor, error) {
 		l, err := link.Tracepoint(s.group, s.name, prog, nil)
 		if err != nil {
 			if s.optional {
+				log.Printf("ringwall: optional tracepoint %s/%s not attached: %v", s.group, s.name, err)
 				continue
 			}
 			cleanup(links)

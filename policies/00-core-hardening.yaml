@@ -109,3 +109,13 @@ rules:
       exclude_exe_paths:
         - '/usr/lib/systemd/systemd-udevd'
         - '/lib/systemd/systemd-udevd'
+
+  - id: RW-CORE-007
+    name: io_uring ring setup (syscall-bypass evasion)
+    category: core-hardening
+    severity: critical
+    action: freeze
+    mitre: T1055
+    description: Detects and freezes processes invoking io_uring_setup so async IORING_OP_* operations cannot bypass syscall tracepoints on kernels older than 6.6.
+    match:
+      event_types: [io_uring]

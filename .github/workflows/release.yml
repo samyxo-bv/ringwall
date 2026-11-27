@@ -32,7 +32,7 @@ jobs:
         run: |
           go mod verify
           make bpf
-          go test -mod=readonly -race ./...
+          go test -count=1 -mod=readonly -race ./...
           VERSION="${GITHUB_REF_NAME}" make build
 
       - name: Package Linux tarball

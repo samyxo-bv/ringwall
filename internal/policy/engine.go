@@ -315,18 +315,21 @@ func matchesRule(r *Rule, ev model.Event) bool {
 	return true
 }
 
-// IsDestructiveRM parses tokenized argv (from eBPF or cmdline) to detect recursive-force rm
-// targeting critical system or home roots regardless of flag ordering, case (-Rf), --, or /bin/rm.
+// IsDestructiveRM parses tokenized argv (plus full /proc/<pid>/cmdline when argv > 8)
+// to detect recursive rm targeting critical system roots or a user's home root,
+// even without -f, with GNU abbreviations (--rec), --, -Rf, or /bin/rm.
 func IsDestructiveRM(ev model.Event) bool {
 	tokens := ev.Argv
-	if len(tokens) == 0 && ev.Cmdline != "" {
-		tokens = strings.Fields(ev.Cmdline)
+	if ev.Cmdline != "" {
+		cmdTokens := strings.Fields(ev.Cmdline)
+		if len(cmdTokens) > len(tokens) {
+			tokens = cmdTokens
+		}
 	}
 	if len(tokens) == 0 {
 		return false
 	}
 
-	// Check both direct rm exec and shell wrapper 'sh -c "rm ..."'
 	if checkRMTokens(tokens, ev.Exe) {
 		return true
 	}
@@ -352,7 +355,6 @@ func checkRMTokens(tokens []string, exe string) bool {
 	}
 
 	recursive := false
-	force := false
 	endOfOpts := false
 	var targets []string
 
@@ -365,21 +367,16 @@ func checkRMTokens(tokens []string, exe string) bool {
 			continue
 		}
 		if !endOfOpts && strings.HasPrefix(tok, "--") {
-			switch tok {
-			case "--recursive":
+			// Support GNU option abbreviations (--rec, --recurs, --recursive).
+			if len(tok) >= 4 && strings.HasPrefix("--recursive", tok) {
 				recursive = true
-			case "--force":
-				force = true
 			}
 			continue
 		}
 		if !endOfOpts && strings.HasPrefix(tok, "-") && len(tok) > 1 {
 			for _, ch := range tok[1:] {
-				switch ch {
-				case 'r', 'R':
+				if ch == 'r' || ch == 'R' {
 					recursive = true
-				case 'f':
-					force = true
 				}
 			}
 			continue
@@ -387,22 +384,45 @@ func checkRMTokens(tokens []string, exe string) bool {
 		targets = append(targets, tok)
 	}
 
-	if !recursive || !force {
+	if !recursive {
 		return false
 	}
 
-	dangerous := map[string]bool{
-		"/": true, "/*": true, "/etc": true, "/usr": true, "/var": true,
-		"/bin": true, "/sbin": true, "/lib": true, "/boot": true,
-		"/home": true, "/root": true, "~": true, "~/*": true, "$HOME": true, "${HOME}": true,
+	exactDangerous := map[string]bool{
+		"/": true, "/*": true, "~": true, "~/*": true, "$HOME": true, "${HOME}": true,
 	}
+	criticalPrefixes := []string{
+		"/etc", "/usr", "/var", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/root",
+	}
+
 	for _, t := range targets {
 		raw := strings.TrimSpace(t)
-		if dangerous[raw] || dangerous[cleanSlash(raw)] {
+		if raw == "" {
+			continue
+		}
+		cleaned := cleanSlash(raw)
+		if exactDangerous[raw] || exactDangerous[cleaned] {
 			return true
 		}
-		if strings.HasPrefix(raw, "/etc/") && strings.Count(cleanSlash(raw), "/") <= 1 {
+		for _, pref := range criticalPrefixes {
+			if cleaned == pref || strings.HasPrefix(cleaned, pref+"/") {
+				// Allow harmless /var/tmp/* cleanup; protect everything else under /var, /etc, /usr, etc.
+				if strings.HasPrefix(cleaned, "/var/tmp/") {
+					continue
+				}
+				return true
+			}
+		}
+		// Protect /home and top-level /home/<user> (shell expands ~ before execve),
+		// while still allowing deep project build-dir cleanup like /home/alice/proj/dist.
+		if cleaned == "/home" || cleaned == "/home/*" {
 			return true
+		}
+		if strings.HasPrefix(cleaned, "/home/") {
+			rest := strings.TrimPrefix(cleaned, "/home/")
+			if rest != "" && !strings.Contains(rest, "/") {
+				return true
+			}
 		}
 	}
 	return false

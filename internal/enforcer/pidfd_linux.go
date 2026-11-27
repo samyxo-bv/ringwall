@@ -16,21 +16,24 @@ import (
 	"github.com/samyxo-bv/ringwall/internal/lineage"
 )
 
-var ErrPIDRecycled = errors.New("process start time changed; refusing to signal recycled PID")
+var (
+	ErrPIDRecycled      = errors.New("process start time changed; refusing to signal recycled PID")
+	ErrMissingStartTime = errors.New("process start time unknown (0); refusing unverified PID signal")
+)
 
 type osSignaler struct{}
 
-// SignalVerified opens a kernel pidfd, verifies /proc/<pid>/stat starttime still matches
-// expectedStartTime (defeating PID-reuse races), and signals via pidfd_send_signal.
+// SignalVerified opens a kernel pidfd, strictly requires expectedStartTime > 0, verifies
+// /proc/<pid>/stat starttime still matches (defeating PID-reuse races), and signals via pidfd_send_signal.
 func (osSignaler) SignalVerified(pid int, expectedStartTime uint64, sig syscall.Signal) error {
+	if expectedStartTime == 0 {
+		return ErrMissingStartTime
+	}
 	fd, err := unix.PidfdOpen(pid, 0)
 	if err != nil {
-		// Fall back only if kernel lacks pidfd_open (ENOSYS) and starttime still matches.
 		if errors.Is(err, unix.ENOSYS) {
-			if expectedStartTime > 0 {
-				if cur, ok := lineage.ReadProcessStartTime(pid); !ok || cur != expectedStartTime {
-					return ErrPIDRecycled
-				}
+			if cur, ok := lineage.ReadProcessStartTime(pid); !ok || cur != expectedStartTime {
+				return ErrPIDRecycled
 			}
 			return syscall.Kill(pid, sig)
 		}
@@ -38,18 +41,13 @@ func (osSignaler) SignalVerified(pid int, expectedStartTime uint64, sig syscall.
 	}
 	defer unix.Close(fd)
 
-	if expectedStartTime > 0 {
-		cur, ok := lineage.ReadProcessStartTime(pid)
-		if !ok || cur != expectedStartTime {
-			return ErrPIDRecycled
-		}
+	cur, ok := lineage.ReadProcessStartTime(pid)
+	if !ok || cur != expectedStartTime {
+		return ErrPIDRecycled
 	}
 	return unix.PidfdSendSignal(fd, sig, nil, 0)
 }
 
-// TryFreezeCgroup freezes the process's cgroup v2 freezer when running inside a dedicated
-// isolated workload/agent cgroup (preventing same-UID kill -CONT escape).
-// It strictly refuses to freeze root /, init.scope, ringwalld's own cgroup, or interactive login sessions.
 func TryFreezeCgroup(pid int) (string, bool) {
 	if pid <= 1 {
 		return "", false
@@ -97,7 +95,6 @@ func readCgroupV2Path(pid int) (string, bool) {
 
 func isIsolatedWorkloadCgroup(cgPath string) bool {
 	low := strings.ToLower(cgPath)
-	// Never freeze a whole interactive tty login session automatically.
 	if strings.Contains(low, "session-") && !strings.Contains(low, "ringwall-agent") {
 		return false
 	}

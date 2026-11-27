@@ -22,6 +22,7 @@ const (
 	rawEventOpenat  uint32 = 2
 	rawEventConnect uint32 = 3
 	rawEventSendto  uint32 = 4
+	rawEventIOUring uint32 = 5
 
 	rawAFInet  uint16 = 2
 	rawAFInet6 uint16 = 10
@@ -29,7 +30,7 @@ const (
 	openWriteMask uint32 = 0x0001 | 0x0002 | 0x0040 // O_WRONLY | O_RDWR | O_CREAT
 )
 
-// RawEvent matches struct ringwall_event in ebpf/ringwall.bpf.c byte-for-byte (1280 bytes).
+// RawEvent matches struct ringwall_event in ebpf/ringwall.bpf.c byte-for-byte (1344 bytes).
 type RawEvent struct {
 	Type   uint32
 	PID    uint32
@@ -42,7 +43,7 @@ type RawEvent struct {
 	Pad    uint32
 	Addr   [16]byte
 	Comm   [16]byte
-	Path   [192]byte
+	Path   [256]byte
 	Argv   [8][128]byte
 }
 
@@ -53,7 +54,7 @@ type Sensor interface {
 	Start(ctx context.Context, out chan<- model.Event) error
 }
 
-// DecodeRawEvent converts a 1280-byte eBPF ringbuf record into a model.Event.
+// DecodeRawEvent converts a 1344-byte eBPF ringbuf record into a model.Event.
 func DecodeRawEvent(data []byte, now time.Time) (model.Event, error) {
 	var raw RawEvent
 	if err := binary.Read(bytes.NewReader(data), binary.LittleEndian, &raw); err != nil {
@@ -101,6 +102,9 @@ func DecodeRawEvent(data []byte, now time.Time) (model.Event, error) {
 			ip := netip.AddrFrom16(raw.Addr)
 			ev.DstIP = ip.String()
 		}
+	case rawEventIOUring:
+		ev.Type = model.EventIOUring
+		ev.Cmdline = fmt.Sprintf("io_uring_setup(entries=%d)", raw.Flags)
 	default:
 		return model.Event{}, fmt.Errorf("unknown bpf event type %d", raw.Type)
 	}

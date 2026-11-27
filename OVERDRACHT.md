@@ -3,8 +3,8 @@
 ## Current Status (2026-11-27)
 
 - **Repository:** `https://github.com/samyxo-bv/ringwall` (public, Apache-2.0).
-- **Branch / PR:** `feat/v0.1-mvp` (PR #1) — all P0-1, P1-1..P1-7, and key P2 findings from independent Claude Opus 5.5 security review (`thr_p8xe9zd4tv`) have been remediated.
-- **Open:** Verify green CI (eBPF + `go test -mod=readonly -race` + live root host test + 8 live QEMU ISO assertions), run Claude Opus 5.5 re-review on new HEAD, merge PR #1, and tag `v0.1.0` release with verified `.iso`.
+- **Branch / PR:** `feat/v0.1-mvp` (PR #1) — all P0-1, P1-1..P1-7, and re-review P1-A..P1-E + P2 findings from Claude Opus 5.5 (`thr_p8xe9zd4tv`, `thr_wjgxpdp3ji`) remediated.
+- **Open:** Verify green CI (10 live QEMU ISO assertions incl. `io_uring_setup`, `//home`, `/proc/self/cwd`, `/tmp/d` directory symlink, `rm -r /usr`), final Claude Opus 5.5 re-review `AKKOORD`, merge PR #1, and tag `v0.1.0`.
 
 ## Key Architecture Decisions
 

@@ -81,10 +81,15 @@ func TestDestructiveRMAllBypassVariants(t *testing.T) {
 	shouldCatch := [][]string{
 		{"rm", "-rf", "--no-preserve-root", "/"},
 		{"rm", "-r", "-f", "/"},
+		{"rm", "-r", "/usr"},
+		{"rm", "--rec", "--forc", "/usr"},
 		{"rm", "-rf", "--", "/"},
 		{"rm", "-Rf", "/"},
 		{"/bin/rm", "-rf", "/"},
 		{"/usr/bin/rm", "--recursive", "--force", "/etc"},
+		{"rm", "-rf", "/home/operator"},
+		{"rm", "-rf", "/var/lib"},
+		{"rm", "-rf", "/usr/local"},
 		{"rm", "-fr", "~"},
 		{"bash", "-c", "rm -r -f -- /home"},
 	}
@@ -96,9 +101,22 @@ func TestDestructiveRMAllBypassVariants(t *testing.T) {
 		}
 	}
 
+	// >8 arguments (truncated eBPF argv, full cmdline from /proc/<pid>/cmdline) MUST still match!
+	longEv := model.Event{
+		Type:    model.EventExec,
+		Exe:     "/usr/bin/rm",
+		Argv:    []string{"rm", "-rf", "a", "b", "c", "d", "e", "f"},
+		Cmdline: "rm -rf a b c d e f g /usr",
+	}
+	if matches, act, _ := eng.Evaluate(longEv); len(matches) != 1 || act != model.ActionKill {
+		t.Errorf("expected >8-arg rm to be caught via cmdline, got matches=%d act=%s", len(matches), act)
+	}
+
 	// Normal safe cleanup MUST NOT false-positive.
 	safe := [][]string{
 		{"rm", "-rf", "/tmp/my-build-dir"},
+		{"rm", "-rf", "/var/tmp/cache"},
+		{"rm", "-rf", "/home/alice/project/dist"},
 		{"rm", "-f", "/home/alice/project/dist/app.o"},
 		{"ls", "-rf", "/"},
 	}

@@ -9,6 +9,7 @@ const (
 	EventExec      EventType = "exec"
 	EventOpen      EventType = "open"
 	EventConnect   EventType = "connect"
+	EventIOUring   EventType = "io_uring"
 	EventSimulated EventType = "simulated"
 )
 
@@ -186,6 +187,7 @@ type DaemonStatus struct {
 	PolicyCount    int       `json:"policy_count"`
 	EventsTotal    uint64    `json:"events_total"`
 	DroppedEvents  uint64    `json:"dropped_events"`
+	AISkipped      uint64    `json:"ai_skipped"`
 	IncidentsTotal uint64    `json:"incidents_total"`
 	FrozenCount    int       `json:"frozen_count"`
 	AIEnabled      bool      `json:"ai_enabled"`

@@ -78,6 +78,11 @@ func TestEnforcerModesAgentAncestorFreezeAndNFTValidation(t *testing.T) {
 		t.Fatalf("expected loopback IP to be rejected")
 	}
 
+	// osSignaler MUST refuse unverified PIDs with StartTime == 0 (prevents recycled-PID SIGKILL).
+	if err := (osSignaler{}).SignalVerified(999999, 0, syscall.SIGSTOP); err != ErrMissingStartTime {
+		t.Fatalf("expected ErrMissingStartTime when startTime==0, got %v", err)
+	}
+
 	// Strict mode executes SIGKILL directly.
 	msStrict := &mockSignaler{}
 	enfStrict := New(config.ModeStrict, config.EnforcerConfig{EnableSignals: true}, msStrict, mf)

@@ -95,7 +95,7 @@ Open the local web UI + Setup Wizard at `http://127.0.0.1:9443` using the root-o
 Ringwall ships an automated **hybrid BIOS + UEFI bootable Linux appliance ISO** (`iso/build-iso.sh`) built on minimal Debian Bookworm (pin `DEBIAN_MIRROR` to a `snapshot.debian.org` URL + `SOURCE_DATE_EPOCH` for pinned builds):
 
 - **Read-only SquashFS root filesystem** + ephemeral RAM overlay (reboot wipes all runtime state and persistence attempts).
-- **Kernel hardening boot parameters** (`lockdown=integrity`, `init_on_alloc=1`, `init_on_free=1`, `slab_nomerge`, `pti=on`, `randomize_kstack_offset=on`) + strict `sysctl` profile including `kernel.io_uring_disabled = 2`.
+- **Kernel hardening boot parameters** (`lockdown=integrity`, `init_on_alloc=1`, `init_on_free=1`, `slab_nomerge`, `pti=on`, `randomize_kstack_offset=on`) + strict `sysctl` profile (`kernel.io_uring_disabled = 2` on kernels 6.6+, plus live eBPF `io_uring_setup` freeze on kernel 6.1+).
 - **Default-deny `nftables` firewall** with dynamic `blocked_v4` / `blocked_v6` sets driven by `ringwalld`.
 - **Strict privilege isolation:** no SSH server, locked `root` and `operator` passwords, monitored `operator` user has zero access to `/run/ringwall/api.token` (`0600 root`) or `/var/log/ringwall/audit.jsonl`.
 - **Optional air-gapped AI model bundle:** pass `--with-model /path/to/model.gguf` to bake an abliterated GGUF directly into the read-only SquashFS.
@@ -109,11 +109,12 @@ sudo ./iso/build-iso.sh --out dist/ringwall-appliance-amd64.iso
 ```
 
 Every CI run boots the freshly built `.iso` in QEMU as the unprivileged monitored user and proves live inside the VM that:
-1. Rootfs is read-only SquashFS, `sshd` is absent, and `io_uring` is disabled.
+1. Rootfs is read-only SquashFS and `sshd` is absent.
 2. Monitored user `operator` **cannot** read `/run/ringwall/api.token` or `/var/log/ringwall/audit.jsonl` and gets HTTP `401` from the control API.
 3. `ringwalld` runs with the live **eBPF** kernel sensor and `0` dropped events.
-4. Direct `~/.ssh/id_ed25519` read, relative-path bypass (`cd ~/.ssh && open('id_ed25519')`), and symlink bypass (`/tmp/k -> ~/.ssh/id_ed25519`) are all caught by eBPF + path canonicalization and frozen in kernel state **`T (stopped)`**.
-5. Live `execve` attacks (`bash -c` reverse-shell pattern and `rm -r -f -- /usr`) are caught and frozen in **`T (stopped)`**.
+4. Calling `io_uring_setup` (syscall 425) is caught by eBPF and frozen in kernel state **`T (stopped)`**.
+5. Direct `~/.ssh/id_ed25519` read, `//home` double-slash bypass, `/proc/self/cwd` bypass, and `/tmp/d/id_ed25519` directory-symlink bypass (across `PrivateTmp=yes`) are all canonicalized and frozen in **`T (stopped)`**.
+6. Live `execve` attacks (`bash -c` reverse-shell pattern and `rm -r /usr` without `-f`) are caught and frozen in **`T (stopped)`**.
 
 ---
 

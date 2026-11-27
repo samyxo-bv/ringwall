@@ -49,7 +49,10 @@ type Daemon struct {
 
 	eventsTotal    atomic.Uint64
 	incidentsTotal atomic.Uint64
+	aiSkipped      atomic.Uint64
 	lastSeenDrops  atomic.Uint64
+
+	pubMu sync.Mutex
 
 	mu        sync.RWMutex
 	incidents []*model.Incident
@@ -210,6 +213,9 @@ func (d *Daemon) CheckDrops() {
 }
 
 func (d *Daemon) writePublicStatus() {
+	d.pubMu.Lock()
+	defer d.pubMu.Unlock()
+
 	d.cfgMu.RLock()
 	p := d.publicStatusPath
 	d.cfgMu.RUnlock()
@@ -225,6 +231,7 @@ func (d *Daemon) writePublicStatus() {
 		"policy_count":    st.PolicyCount,
 		"events_total":    st.EventsTotal,
 		"dropped_events":  st.DroppedEvents,
+		"ai_skipped":      st.AISkipped,
 		"incidents_total": st.IncidentsTotal,
 		"frozen_count":    st.FrozenCount,
 		"updated_at":      time.Now().UTC().Format(time.RFC3339),
@@ -294,9 +301,10 @@ func (d *Daemon) ProcessEvent(ctx context.Context, ev model.Event, syncAI bool) 
 		EnforcementNote:     note,
 	}
 
+	initialSnapshot := *inc
 	d.storeIncident(inc)
-	d.recordAudit("incident.created", inc)
-	d.broadcast(*inc)
+	d.recordAudit("incident.created", initialSnapshot)
+	d.broadcast(initialSnapshot)
 	d.writePublicStatus()
 
 	runAI := func() {
@@ -343,7 +351,12 @@ func (d *Daemon) ProcessEvent(ctx context.Context, ev model.Event, syncAI bool) 
 				runAI()
 			}()
 		default:
-			// Pool saturated: deterministic enforcement & audit already completed.
+			skipped := d.aiSkipped.Add(1)
+			d.recordAudit("incident.ai_skipped", map[string]any{
+				"incident_id": initialSnapshot.ID,
+				"ai_skipped":  skipped,
+				"reason":      "ai worker pool saturated",
+			})
 		}
 	}
 
@@ -357,10 +370,10 @@ func (d *Daemon) HandleOperatorAction(id, opAction string) (*model.Incident, err
 		d.mu.Unlock()
 		return nil, fmt.Errorf("incident %q not found", id)
 	}
-	if inc.Status == model.StatusKilled || inc.Status == model.StatusResumed || inc.Status == model.StatusAllowed {
+	if inc.Status != model.StatusFrozen && inc.Status != model.StatusBlocked {
 		st := inc.Status
 		d.mu.Unlock()
-		return nil, fmt.Errorf("incident %q already finalized with status %q", id, st)
+		return nil, fmt.Errorf("incident %q has status %q; operator actions only apply to frozen or blocked incidents", id, st)
 	}
 	ev := inc.Event
 	cgPath := inc.CgroupFrozenPath
@@ -523,6 +536,7 @@ func (d *Daemon) Status() model.DaemonStatus {
 		PolicyCount:    d.policy.Count(),
 		EventsTotal:    d.eventsTotal.Load(),
 		DroppedEvents:  dropped,
+		AISkipped:      d.aiSkipped.Load(),
 		IncidentsTotal: d.incidentsTotal.Load(),
 		FrozenCount:    frozen,
 		AIEnabled:      cfg.AI.Enabled && len(aiModels) > 0,
