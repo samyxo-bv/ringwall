@@ -60,17 +60,21 @@ func TestHostPatcherRejectsInjectionAndProtectsCriticalServices(t *testing.T) {
 		t.Fatalf("expected 1 patched + 2 rejected, got patched=%d failed=%d: %+v", patched, failed, res)
 	}
 
-	// Verify stale service restarts skip protected ringwalld.service & sshd.service while restarting nginx.service.
+	// Verify stale service restarts skip ringwalld, sshd, and user@1000 while restarting nginx.
 	restarts := RestartStaleServices(context.Background(), fr, []scanner.StaleProcess{
 		{PID: 10, SystemdUnit: "ringwalld.service"},
 		{PID: 11, SystemdUnit: "sshd.service"},
-		{PID: 12, SystemdUnit: "nginx.service"},
+		{PID: 12, SystemdUnit: "user@1000.service"},
+		{PID: 13, SystemdUnit: "nginx.service"},
 	}, false)
 	byUnit := map[string]string{}
 	for _, r := range restarts {
 		byUnit[r.Unit] = r.Status
 	}
-	if byUnit["ringwalld.service"] != "skipped_protected" || byUnit["sshd.service"] != "skipped_protected" || byUnit["nginx.service"] != "restarted" {
+	if byUnit["ringwalld.service"] != "skipped_protected" ||
+		byUnit["sshd.service"] != "skipped_protected" ||
+		byUnit["user@1000.service"] != "skipped_protected" ||
+		byUnit["nginx.service"] != "restarted" {
 		t.Fatalf("unexpected restart statuses: %+v", byUnit)
 	}
 }
@@ -95,29 +99,55 @@ func TestDriftAutoRemediation(t *testing.T) {
 	}
 }
 
-func TestVirtualPatchAntiLockoutLiveEnforceAndAutoRevoke(t *testing.T) {
+func TestVirtualPatchP0AntiLockoutSymlinksAliasesGlobsPortsAndAIKill(t *testing.T) {
+	dir := t.TempDir()
 	eng, err := policy.NewEngine(nil)
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
 	blocker := &fakeKernelBlocker{}
-	mgr := NewVirtualPatchManager(eng, blocker, filepath.Join(t.TempDir(), "99-virtual-patches.yaml"))
+	mgr := NewVirtualPatchManager(eng, blocker, filepath.Join(dir, "virtual-patches.json"))
 
-	// Anti-lockout MUST reject ringwalld, bash, and overbroad /** globs!
+	// Create a real temp protected binary + symlink (simulates /usr/bin/rbash -> /usr/bin/bash).
+	fakeBash := filepath.Join(dir, "real-bash")
+	_ = os.WriteFile(fakeBash, []byte("#!/bin/sh\n"), 0o755)
+	mgr.AddProtectedBinaryForTest(fakeBash)
+	fakeRbash := filepath.Join(dir, "rbash-link")
+	_ = os.Symlink(fakeBash, fakeRbash)
+
 	badCases := []VirtualPatch{
 		{ID: "VP-BAD-1", CVE: "CVE-1", TargetExePaths: []string{"/usr/local/bin/ringwalld"}, Action: model.ActionFreeze, ExpiresAt: time.Now().Add(time.Hour)},
-		{ID: "VP-BAD-2", CVE: "CVE-2", TargetExePaths: []string{"/usr/bin/bash"}, Action: model.ActionKill, ExpiresAt: time.Now().Add(time.Hour)},
-		{ID: "VP-BAD-3", CVE: "CVE-3", TargetPathGlobs: []string{"/**"}, Action: model.ActionFreeze, ExpiresAt: time.Now().Add(time.Hour)},
-		{ID: "VP-BAD-4", CVE: "CVE-4", Action: model.ActionFreeze, ExpiresAt: time.Now().Add(time.Hour)}, // empty matchers
+		{ID: "VP-BAD-2", CVE: "CVE-2", TargetExePaths: []string{"/usr/bin/rbash"}, Action: model.ActionFreeze, ExpiresAt: time.Now().Add(time.Hour)},
+		{ID: "VP-BAD-3", CVE: "CVE-3", TargetExePaths: []string{fakeRbash}, Action: model.ActionFreeze, ExpiresAt: time.Now().Add(time.Hour)},
+		{ID: "VP-BAD-4", CVE: "CVE-4", TargetExePaths: []string{"/sbin/sshd"}, Action: model.ActionFreeze, ExpiresAt: time.Now().Add(time.Hour)},
+		{ID: "VP-BAD-5", CVE: "CVE-5", TargetExePaths: []string{"/usr/lib/openssh/sshd-session"}, Action: model.ActionFreeze, ExpiresAt: time.Now().Add(time.Hour)},
+		{ID: "VP-BAD-6", CVE: "CVE-6", TargetExePaths: []string{"/bin/apt-get"}, Action: model.ActionFreeze, ExpiresAt: time.Now().Add(time.Hour)},
+		{ID: "VP-BAD-7", CVE: "CVE-7", TargetPathGlobs: []string{"/**/*"}, Action: model.ActionFreeze, ExpiresAt: time.Now().Add(time.Hour)},
+		{ID: "VP-BAD-8", CVE: "CVE-8", TargetPathGlobs: []string{"/usr/**/*"}, Action: model.ActionFreeze, ExpiresAt: time.Now().Add(time.Hour)},
+		{ID: "VP-BAD-9", CVE: "CVE-9", TargetPathGlobs: []string{"/etc/ssh/**"}, Action: model.ActionFreeze, ExpiresAt: time.Now().Add(time.Hour)},
+		{ID: "VP-BAD-10", CVE: "CVE-10", TargetPathGlobs: []string{"/etc/ssh/sshd_config"}, Action: model.ActionFreeze, ExpiresAt: time.Now().Add(time.Hour)},
+		{ID: "VP-BAD-11", CVE: "CVE-11", TargetPathGlobs: []string{"/var/*"}, Action: model.ActionFreeze, ExpiresAt: time.Now().Add(time.Hour)},
+		{ID: "VP-BAD-12", CVE: "CVE-12", TargetPorts: []uint16{22}, Source: "ai_assisted", Action: model.ActionBlockEgress, ExpiresAt: time.Now().Add(time.Hour)},
+		{ID: "VP-BAD-13", CVE: "CVE-13", TargetPorts: []uint16{443}, Source: "ai_assisted", Action: model.ActionBlockEgress, ExpiresAt: time.Now().Add(time.Hour)},
+		{ID: "VP-BAD-14", CVE: "CVE-14", TargetExePaths: []string{"/usr/sbin/vuln-httpd"}, Source: "ai_assisted", Action: model.ActionKill, ExpiresAt: time.Now().Add(time.Hour)},
+		{ID: "VP-BAD-15", CVE: "CVE-15", Action: model.ActionFreeze, ExpiresAt: time.Now().Add(time.Hour)}, // empty matchers
 	}
 	for _, bad := range badCases {
 		if _, err := mgr.Apply(bad); err == nil {
-			t.Errorf("expected anti-lockout to reject %s", bad.ID)
+			t.Errorf("P0 REGRESSION: anti-lockout MUST reject %s (%+v)", bad.ID, bad)
 		}
 	}
+}
 
-	// Valid 0-day virtual patch for /usr/sbin/vuln-httpd activates live in policy.Engine AND kernel LSM blocker.
-	vp, err := mgr.Apply(VirtualPatch{
+func TestVirtualPatchFailClosedReconcileAndRestartPersistence(t *testing.T) {
+	dir := t.TempDir()
+	storePath := filepath.Join(dir, "virtual-patches.json")
+
+	eng1, _ := policy.NewEngine(nil)
+	blocker1 := &fakeKernelBlocker{}
+	mgr1 := NewVirtualPatchManager(eng1, blocker1, storePath)
+
+	_, err := mgr1.Apply(VirtualPatch{
 		ID:             "VP-CVE-2026-99999",
 		CVE:            "CVE-2026-99999",
 		Package:        "vuln-httpd",
@@ -129,26 +159,64 @@ func TestVirtualPatchAntiLockoutLiveEnforceAndAutoRevoke(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Apply valid virtual patch: %v", err)
 	}
-	if !vp.KernelLSMActive || len(blocker.synced) != 1 || blocker.synced[0] != "/usr/sbin/vuln-httpd" {
-		t.Fatalf("expected kernel LSM exec blocker synced, got %+v", blocker.synced)
+
+	// P1-3 REGRESSION CHECK: feed error / incomplete scan MUST NOT auto-revoke active 0-day patch!
+	erroredScan := scanner.ScanReport{
+		PackageCount: 100,
+		Complete:     false,
+		FeedErrors:   []string{"osv: connection refused"},
+		Findings:     nil,
+	}
+	if revoked := mgr1.Reconcile(erroredScan, time.Now().UTC()); len(revoked) != 0 {
+		t.Fatalf("P1-3 REGRESSION: feed error caused fail-open revocation: %v", revoked)
+	}
+	if len(mgr1.List()) != 1 {
+		t.Fatalf("expected virtual patch preserved across errored scan")
 	}
 
-	matches, act, _ := eng.Evaluate(model.Event{Type: model.EventExec, Exe: "/usr/sbin/vuln-httpd", Comm: "vuln-httpd"})
-	if len(matches) != 1 || act != model.ActionFreeze {
-		t.Fatalf("expected live virtual patch match, got matches=%d act=%s", len(matches), act)
+	// P1-4 REGRESSION CHECK: simulate daemon restart with fresh Engine, Blocker, and Manager!
+	eng2, _ := policy.NewEngine(nil)
+	blocker2 := &fakeKernelBlocker{}
+	mgr2 := NewVirtualPatchManager(eng2, blocker2, storePath)
+	n, err := mgr2.LoadPersisted()
+	if err != nil || n != 1 {
+		t.Fatalf("P1-4 REGRESSION: LoadPersisted failed: loaded=%d err=%v", n, err)
+	}
+	if len(blocker2.synced) != 1 || blocker2.synced[0] != "/usr/sbin/vuln-httpd" {
+		t.Fatalf("P1-4 REGRESSION: kernel LSM exec blocker not restored after restart: %+v", blocker2.synced)
+	}
+	if matches, act, _ := eng2.Evaluate(model.Event{Type: model.EventExec, Exe: "/usr/sbin/vuln-httpd"}); len(matches) != 1 || act != model.ActionFreeze {
+		t.Fatalf("P1-4 REGRESSION: policy rule not active after restart")
+	}
+	if !mgr2.Revoke("VP-CVE-2026-99999") {
+		t.Fatalf("P1-4 REGRESSION: Revoke after restart returned false")
+	}
+	if len(blocker2.synced) != 0 {
+		t.Fatalf("expected kernel blocker cleared after Revoke, got %+v", blocker2.synced)
 	}
 
-	// Auto-revoke once upstream scan no longer reports CVE-2026-99999.
-	revoked := mgr.Reconcile(nil, time.Now().UTC())
-	if len(revoked) != 1 || revoked[0] != "VP-CVE-2026-99999" {
-		t.Fatalf("expected auto-revocation after CVE resolved, got %v", revoked)
+	// Re-apply and verify Complete scan (0 errors, positive inventory, CVE resolved) DOES auto-revoke cleanly.
+	_, _ = mgr2.Apply(VirtualPatch{
+		ID:             "VP-CVE-2026-99999",
+		CVE:            "CVE-2026-99999",
+		Package:        "vuln-httpd",
+		TargetExePaths: []string{"/usr/sbin/vuln-httpd"},
+		Action:         model.ActionFreeze,
+		Source:         "deterministic",
+		ExpiresAt:      time.Now().UTC().Add(24 * time.Hour),
+	})
+	completeClean := scanner.ScanReport{
+		PackageCount:    100,
+		Complete:        true,
+		OfflineDBLoaded: true,
+		Findings:        nil,
 	}
-	if matches, _, _ := eng.Evaluate(model.Event{Type: model.EventExec, Exe: "/usr/sbin/vuln-httpd"}); len(matches) != 0 {
-		t.Fatalf("revoked virtual patch still matched")
+	if revoked := mgr2.Reconcile(completeClean, time.Now().UTC()); len(revoked) != 1 {
+		t.Fatalf("expected auto-revocation on Complete clean scan, got %v", revoked)
 	}
 }
 
-func TestSignedABUpdaterVerifyStagePromoteAndAutoRollback(t *testing.T) {
+func TestSignedABUpdaterRequiresRealBootSlotBeforePromotion(t *testing.T) {
 	pub, priv, err := GenerateABKeypair()
 	if err != nil {
 		t.Fatalf("GenerateABKeypair: %v", err)
@@ -164,18 +232,22 @@ func TestSignedABUpdaterVerifyStagePromoteAndAutoRollback(t *testing.T) {
 	defer srv.Close()
 
 	dir := t.TempDir()
+	bootedSlot := "A"
 	up := &ABUpdater{
+		Enabled:        true,
 		StatePath:      filepath.Join(dir, "ab-state.json"),
 		BootEnvPath:    filepath.Join(dir, "ab-boot.env"),
 		SlotAPath:      filepath.Join(dir, "slot_a.squashfs"),
 		SlotBPath:      filepath.Join(dir, "slot_b.squashfs"),
 		TrustedPubKey:  pub,
 		CurrentVersion: "v0.1.0",
+		BootedSlotFunc: func() string { return bootedSlot },
 		HTTPClient:     srv.Client(),
 	}
 
 	manifest := ABManifest{
 		Version:     "v0.2.0",
+		MinVersion:  "v0.1.0",
 		ReleaseURL:  srv.URL + "/ringwall-v0.2.0.squashfs",
 		ImageSHA256: imgHash,
 		ImageSize:   int64(len(imgPayload)),
@@ -186,46 +258,53 @@ func TestSignedABUpdaterVerifyStagePromoteAndAutoRollback(t *testing.T) {
 		t.Fatalf("SignManifest: %v", err)
 	}
 
-	// 1. Tampered manifest MUST fail Ed25519 verification.
+	// 1. Tampered manifest, downgrade, and violated MinVersion MUST fail.
 	tampered := manifest
 	tampered.Version = "v0.2.1"
 	if err := VerifyManifest(pub, "v0.1.0", tampered); err == nil {
-		t.Fatalf("expected tampered manifest to fail signature check")
+		t.Fatalf("expected tampered manifest rejected")
 	}
-
-	// 2. Downgrade manifest MUST fail anti-downgrade check even if legitimately signed!
 	oldM := manifest
 	oldM.Version = "v0.0.9"
 	_ = SignManifest(priv, &oldM)
 	if err := VerifyManifest(pub, "v0.1.0", oldM); err == nil {
-		t.Fatalf("expected downgrade manifest to be rejected")
+		t.Fatalf("expected downgrade manifest rejected")
+	}
+	if err := VerifyManifest(pub, "v0.0.5", manifest); err == nil {
+		t.Fatalf("expected MinVersion violation rejected")
 	}
 
-	// 3. Valid stage writes to inactive slot B and arms 2 boot tries.
+	// 2. Stage update to slot B.
 	st, err := up.StageUpdate(context.Background(), manifest)
-	if err != nil {
-		t.Fatalf("StageUpdate: %v", err)
-	}
-	if st.PendingSlot != "B" || st.TriesRemaining != 2 {
-		t.Fatalf("unexpected staged state: %+v", st)
+	if err != nil || st.PendingSlot != "B" || st.TriesRemaining != 2 {
+		t.Fatalf("StageUpdate failed: st=%+v err=%v", st, err)
 	}
 
-	// 4. Two failed boots MUST automatically roll back to LastKnownGoodSlot ("A").
-	st, rolled, err := up.ConfirmBootHealth(false)
+	// 3. P1-5 REGRESSION CHECK: daemon restart while STILL booted in slot A MUST NOT promote slot B!
+	st, rolled, err := up.ConfirmBootHealth(true)
+	if err != nil || rolled || st.PendingSlot != "B" || st.ActiveSlot != "A" || st.TriesRemaining != 2 {
+		t.Fatalf("P1-5 REGRESSION: daemon restart without reboot falsely promoted unbooted slot B: %+v", st)
+	}
+
+	// 4. Now simulate actual reboot into slot B with two failed health checks -> auto-rollback to A!
+	bootedSlot = "B"
+	st, rolled, err = up.ConfirmBootHealth(false)
 	if err != nil || rolled || st.TriesRemaining != 1 {
-		t.Fatalf("first boot fail should decrement tries to 1, got rolled=%v state=%+v err=%v", rolled, st, err)
+		t.Fatalf("first boot fail on B should decrement tries to 1, got %+v", st)
 	}
 	st, rolled, err = up.ConfirmBootHealth(false)
 	if err != nil || !rolled || st.ActiveSlot != "A" || st.PendingSlot != "" || st.RolledBackFrom != "v0.2.0" {
-		t.Fatalf("second boot fail must auto-rollback to slot A, got rolled=%v state=%+v err=%v", rolled, st, err)
+		t.Fatalf("second boot fail on B must auto-rollback to A, got rolled=%v st=%+v", rolled, st)
 	}
 
-	// 5. Re-stage and confirm healthy boot promotes slot B -> ActiveSlot & LastKnownGoodSlot!
+	// 5. Re-stage from A, reboot into B, and confirm healthy boot promotes B!
+	bootedSlot = "A"
 	if _, err := up.StageUpdate(context.Background(), manifest); err != nil {
 		t.Fatalf("re-StageUpdate: %v", err)
 	}
+	bootedSlot = "B"
 	st, rolled, err = up.ConfirmBootHealth(true)
 	if err != nil || rolled || st.ActiveSlot != "B" || st.LastKnownGoodSlot != "B" || st.CurrentVersion != "v0.2.0" {
-		t.Fatalf("expected healthy promotion to slot B v0.2.0, got rolled=%v state=%+v err=%v", rolled, st, err)
+		t.Fatalf("expected healthy promotion to B v0.2.0, got rolled=%v st=%+v", rolled, st)
 	}
 }

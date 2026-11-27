@@ -166,17 +166,27 @@ func newEBPFSensor(cfg config.SensorConfig) (Sensor, error) {
 		return nil, fmt.Errorf("load bpf spec: %w", err)
 	}
 
+	lsmProgs := []string{
+		"trace_lsm_file_open",
+		"trace_lsm_mmap_file",
+		"trace_lsm_ptrace_access_check",
+		"trace_lsm_bprm_check",
+	}
 	lsmReady := bpfLSMAvailable()
 	if !lsmReady {
-		delete(spec.Programs, "trace_lsm_file_open")
-		delete(spec.Programs, "trace_lsm_bprm_check")
+		for _, p := range lsmProgs {
+			delete(spec.Programs, p)
+		}
+		delete(spec.Maps, "task_taint_map")
 	}
 
 	coll, err := ebpf.NewCollection(spec)
-	if err != nil && (spec.Programs["trace_lsm_file_open"] != nil || spec.Programs["trace_lsm_bprm_check"] != nil) {
+	if err != nil && lsmReady {
 		log.Printf("ringwall: eBPF LSM programs failed to load (%v); retrying without LSM hooks", err)
-		delete(spec.Programs, "trace_lsm_file_open")
-		delete(spec.Programs, "trace_lsm_bprm_check")
+		for _, p := range lsmProgs {
+			delete(spec.Programs, p)
+		}
+		delete(spec.Maps, "task_taint_map")
 		lsmReady = false
 		coll, err = ebpf.NewCollection(spec)
 	}
@@ -230,6 +240,24 @@ func newEBPFSensor(cfg config.SensorConfig) (Sensor, error) {
 				openHook = "lsm/file_open"
 				log.Printf("ringwall: attached lsm/file_open (synchronous pre-read kernel blocking active; enforce=%v allowed_ssh=%d pinned_secrets=%d)",
 					cfg.EnableLSMBlocking, sshCount, pinCount)
+			}
+		}
+		if prog := coll.Programs["trace_lsm_mmap_file"]; prog != nil {
+			l, attachErr := link.AttachLSM(link.LSMOptions{Program: prog})
+			if attachErr != nil {
+				log.Printf("ringwall: optional lsm/mmap_file not attached: %v", attachErr)
+			} else {
+				links = append(links, l)
+				log.Printf("ringwall: attached lsm/mmap_file (LD_PRELOAD/PKCS11 taint guard active)")
+			}
+		}
+		if prog := coll.Programs["trace_lsm_ptrace_access_check"]; prog != nil {
+			l, attachErr := link.AttachLSM(link.LSMOptions{Program: prog})
+			if attachErr != nil {
+				log.Printf("ringwall: optional lsm/ptrace_access_check not attached: %v", attachErr)
+			} else {
+				links = append(links, l)
+				log.Printf("ringwall: attached lsm/ptrace_access_check (non-root SSH ptrace guard active)")
 			}
 		}
 		if prog := coll.Programs["trace_lsm_bprm_check"]; prog != nil {

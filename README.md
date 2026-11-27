@@ -36,18 +36,18 @@ Ringwall ships a **step-by-step Setup Wizard** (`sudo ringwallctl setup` and the
 ## Architecture (v0.2)
 
 ```
-  Linux Kernel — Tier 1 Synchronous eBPF LSM (lsm/file_open + lsm/bprm_check_security)
-       │  • Pre-read -EPERM on SSH private keys & pinned secret inodes (defeats hardlinks & source-renames)
-       │  • Non-spoofable caller (s_dev, i_ino) allowlist (defeats /tmp/ssh & PR_SET_NAME)
-       │  • Pre-exec -EPERM on zero-day virtual-patched binaries
+  Linux Kernel — Tier 1 Fail-Closed Synchronous eBPF LSM
+       │  • lsm/file_open: pre-read -EPERM on SSH keys & pinned secret inodes (fail-closed even under floods)
+       │  • lsm/mmap_file + lsm/ptrace_access_check: defeats LD_PRELOAD, PKCS11Provider & ptrace SSH hijacks
+       │  • lsm/bprm_check_security: pre-exec -EPERM on zero-day virtual-patched binaries
        │  • Automatic fallback: fentry/security_file_open (bpf_d_path) -> syscall tracepoints -> procfs
        │  • 4 MiB ringbuf + per-CPU drop counter (RW-SYS-DROP) + exec/rename/link/symlink/connect/io_uring
        ▼
   Layer 1 — Deterministic Policy Engine & Self-Healing Engine (0 ms)
-       │  • Core hardening + AI-agent guard + dynamic TTL-bounded Zero-Day Virtual Patches
+       │  • Core hardening + AI-agent guard + persisted TTL-bounded Zero-Day Virtual Patches (inode anti-lockout)
        │  • Continuous CVE/KEV/drift/stale-lib scanner (OSV.dev + CISA KEV + offline DB)
        │  • Host security-only auto-patcher (apt-get --only-upgrade + stale service restart + anti-lockout)
-       │  • Signed Ed25519 A/B immutable slot updater with boot-counter automatic rollback
+       │  • Signed Ed25519 A/B immutable slot updater (experimental for disk-installed GRUB/systemd-boot)
        │  • Tamper-evident SHA-256 hash-chained audit log (0600 root)
        ▼
   Layer 2 — Bounded Multi-Model Uncensored AI Guardian (Ollama / llama.cpp / Venice / OpenRouter)
@@ -96,15 +96,15 @@ Ringwall ships an automated **hybrid BIOS + UEFI bootable Linux appliance ISO** 
 - **Strict privilege isolation:** no SSH server, locked `root` and `operator` passwords, monitored `operator` user has zero access to `/run/ringwall/api.token` (`0600 root`) or `/var/log/ringwall/audit.jsonl`.
 - **Optional air-gapped AI model bundle:** pass `--with-model /path/to/model.gguf`.
 
-### Live QEMU Verification (15 Security Assertions on Every CI & Release Run)
+### Live QEMU & Host Verification (16 Live ISO + Host LSM Assertions on Every CI & Release Run)
 
-Every CI run boots the freshly built `.iso` headless in QEMU as unprivileged `operator` and proves live inside the VM:
-1. Read-only SquashFS + no `sshd`; `open_hook: lsm/file_open` and `lsm_enforce_active: true`.
+Every CI run verifies `lsm/mmap_file` (`LD_PRELOAD` into `/usr/bin/ssh-keygen` -> `EPERM`) and `lsm/bprm_check_security` (live virtual-patch block & revoke) on the Linux host, AND boots the freshly built `.iso` headless in QEMU as unprivileged `operator` to prove live inside the VM:
+1. Read-only SquashFS + no `sshd`; `open_hook: lsm/file_open`, `lsm_enforce_active: true`, and `ringwall.slot=A`.
 2. Monitored `operator` cannot read `/run/ringwall/api.token` or `/var/log/ringwall/audit.jsonl` and gets HTTP `401`.
-3. Direct SSH key read, `/usr/../home` traversal, `//home` traversal, **hardlinks (`ln ~/.ssh/id_ed25519 ~/hardlink_key`)**, **spoofed `/tmp/ssh` copies**, directory symlinks, cwd-relative opens, and non-`/home` dot-paths (`/tmp/alt/.ssh/id_ed25519`) are **ALL blocked synchronously by the kernel with `EPERM` (0 bytes leaked)**.
+3. Direct SSH key read, `/usr/../home` traversal, `//home` traversal, **hardlinks (preexisting + new)**, **spoofed `/tmp/ssh` copies**, directory symlinks, cwd-relative opens, non-`/home` dot-paths (`/tmp/alt/.ssh/id_ed25519`), and **reads during a live UDP ringbuf-saturation flood** are **ALL blocked synchronously by the kernel with `EPERM` (0 bytes leaked)**.
 4. `USERNS_SYSCTL=0` blocks unprivileged `unshare -Ur chroot`.
 5. `io_uring_setup` (syscall 425), `SYS_rename` & `os.symlink` persistence into `authorized_keys`, `rm --r /usr`, `cd / && rm -r usr`, and `/dev/tcp` reverse shells are all caught and frozen in **`T (stopped)`**.
-6. Ed25519 A/B manifest `ab-keygen` / `ab-sign` / `ab-verify` passes and rejects tampering; `dropped_events: 0`.
+6. Ed25519 A/B manifest `ab-keygen` / `ab-sign` / `ab-verify` passes and rejects tampering; `dropped_events: 0` under normal load.
 
 ---
 

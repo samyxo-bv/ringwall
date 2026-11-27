@@ -44,9 +44,10 @@ jobs:
           bad = []
           for wf in glob.glob(".github/workflows/*.yml"):
               txt = open(wf, encoding="utf-8").read()
-              for m in re.finditer(r"uses:\s*([^@\s]+)@([0-9a-fA-F]+)", txt):
-                  if len(m.group(2)) != 40 or m.group(2) != m.group(2).lower():
-                      bad.append((wf, m.group(1), m.group(2)))
+              for m in re.finditer(r"(?m)^\s*(?:-\s*)?uses:\s*([^@\s]+)@([^\s#]+)", txt):
+                  ref = m.group(2)
+                  if not re.fullmatch(r"[0-9a-f]{40}", ref):
+                      bad.append((wf, m.group(1), ref))
           if bad:
               print("Unpinned or invalid action SHAs:", bad)
               sys.exit(1)

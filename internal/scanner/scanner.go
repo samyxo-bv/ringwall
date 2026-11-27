@@ -78,6 +78,10 @@ func (s *Scanner) Scan(ctx context.Context) ScanReport {
 		}
 	}
 	rep.PackageCount = len(pkgs)
+	rep.InstalledVersions = make(map[string]string, len(pkgs))
+	for _, p := range pkgs {
+		rep.InstalledVersions[p.Name] = p.Version
+	}
 
 	// Detect running executables/libs for exposure scoring and stale deleted libs for restart tracking.
 	activeArtifacts := ActiveProcessArtifacts(s.opts.ProcRoot)
@@ -96,8 +100,11 @@ func (s *Scanner) Scan(ctx context.Context) ScanReport {
 			rep.FeedErrors = append(rep.FeedErrors, "cisa_kev: "+kerr.Error())
 		}
 		if len(pkgs) > 0 {
-			if osvFindings, oerr := queryOSV(ctx, s.opts.HTTPClient, s.opts.OSVBaseURL, pkgs); oerr == nil {
+			if osvFindings, trunc, oerr := queryOSV(ctx, s.opts.HTTPClient, s.opts.OSVBaseURL, pkgs); oerr == nil {
 				rep.Findings = append(rep.Findings, osvFindings...)
+				if trunc {
+					rep.Truncated = true
+				}
 			} else {
 				rep.FeedErrors = append(rep.FeedErrors, "osv: "+oerr.Error())
 			}
@@ -114,6 +121,11 @@ func (s *Scanner) Scan(ctx context.Context) ScanReport {
 			rep.Findings = append(rep.Findings, matchOfflineAdvisories(pkgs, bundle.Advisories)...)
 		}
 	}
+
+	// A scan is Complete (eligible for positive auto-revocation) ONLY when inventory succeeded,
+	// at least one feed source ran cleanly with zero errors, and detail resolution was not truncated.
+	hasAnySource := rep.OnlineFeedsUsed || rep.OfflineDBLoaded
+	rep.Complete = hasAnySource && rep.PackageCount > 0 && len(rep.FeedErrors) == 0 && !rep.Truncated
 
 	// Deduplicate, enrich KEV/exposure, and assign remediation lanes.
 	dedup := make(map[string]int, len(rep.Findings))

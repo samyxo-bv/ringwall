@@ -27,7 +27,7 @@ func TestAPIAuthSimulateSetupAndAuditVerify(t *testing.T) {
 	cfg.Sensor.Mode = "none"
 	cfg.AuditLogPath = filepath.Join(tmp, "audit.jsonl")
 	cfg.API.TokenFile = filepath.Join(tmp, "api.token")
-	cfg.Patcher.VirtualPatchFile = filepath.Join(tmp, "99-virtual-patches.yaml")
+	cfg.Patcher.VirtualPatchFile = filepath.Join(tmp, "virtual-patches.json")
 	cfg.Patcher.ABUpdate.StatePath = filepath.Join(tmp, "ab-state.json")
 	cfg.AI.Enabled = false
 

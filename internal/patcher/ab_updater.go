@@ -24,7 +24,7 @@ import (
 )
 
 const (
-	maxABImageBytes = 2 << 30 // 2 GiB safety cap
+	maxABImageBytes  = 2 << 30 // 2 GiB safety cap
 	defaultBootTries = 2
 )
 
@@ -73,7 +73,8 @@ func SignManifest(privB64 string, m *ABManifest) error {
 	return nil
 }
 
-// VerifyManifest validates the Ed25519 signature, HTTPS URL, SHA-256 format, and anti-downgrade monotonicity.
+// VerifyManifest validates the Ed25519 signature, HTTPS URL, SHA-256 format, MinVersion floor,
+// and anti-downgrade monotonicity.
 func VerifyManifest(pubB64, currentVersion string, m ABManifest) error {
 	pubBytes, err := base64.StdEncoding.DecodeString(strings.TrimSpace(pubB64))
 	if err != nil || len(pubBytes) != ed25519.PublicKeySize {
@@ -101,24 +102,64 @@ func VerifyManifest(pubB64, currentVersion string, m ABManifest) error {
 	if err := validateABURL(m.ReleaseURL); err != nil {
 		return err
 	}
-	// Anti-downgrade check: refuse versions strictly older than currentVersion (unless current is "dev").
+
 	cur := strings.TrimPrefix(strings.TrimSpace(currentVersion), "v")
 	nxt := strings.TrimPrefix(strings.TrimSpace(m.Version), "v")
-	if cur != "" && cur != "dev" && scanner.CompareVersions(nxt, cur) < 0 {
-		return fmt.Errorf("anti-downgrade rejected: manifest %s < current %s", m.Version, currentVersion)
+	if cur != "" {
+		if scanner.CompareVersions(nxt, cur) < 0 {
+			return fmt.Errorf("anti-downgrade rejected: manifest %s < current %s", m.Version, currentVersion)
+		}
+		if minV := strings.TrimPrefix(strings.TrimSpace(m.MinVersion), "v"); minV != "" {
+			if scanner.CompareVersions(cur, minV) < 0 {
+				return fmt.Errorf("upgrade floor rejected: current %s < manifest min_version %s", currentVersion, m.MinVersion)
+			}
+		}
 	}
 	return nil
 }
 
+// ReadBootedSlotFromCmdline parses `ringwall.slot=A` or `ringwall.slot=B` from /proc/cmdline.
+// Returns "" if the kernel cmdline does not declare a Ringwall A/B slot.
+func ReadBootedSlotFromCmdline(cmdlinePath string) string {
+	if cmdlinePath == "" {
+		cmdlinePath = "/proc/cmdline"
+	}
+	b, err := os.ReadFile(cmdlinePath)
+	if err != nil {
+		return ""
+	}
+	for _, tok := range strings.Fields(string(b)) {
+		if strings.HasPrefix(tok, "ringwall.slot=") {
+			val := strings.ToUpper(strings.TrimPrefix(tok, "ringwall.slot="))
+			if val == "A" || val == "B" {
+				return val
+			}
+		}
+	}
+	return ""
+}
+
 // ABUpdater manages verified A/B immutable slot staging, boot-env switching, and automatic rollback.
+// Security invariant (P1-5): ConfirmBootHealth ONLY promotes or rolls back PendingSlot when the
+// actually booted kernel slot (ringwall.slot=...) matches PendingSlot — a daemon restart without
+// rebooting into the new slot NEVER falsely promotes an unbooted image.
 type ABUpdater struct {
-	StatePath       string
-	BootEnvPath     string
-	SlotAPath       string
-	SlotBPath       string
-	TrustedPubKey   string
-	CurrentVersion  string
-	HTTPClient      *http.Client
+	Enabled        bool
+	StatePath      string
+	BootEnvPath    string
+	SlotAPath      string
+	SlotBPath      string
+	TrustedPubKey  string
+	CurrentVersion string
+	BootedSlotFunc func() string
+	HTTPClient     *http.Client
+}
+
+func (u *ABUpdater) bootedSlot() string {
+	if u.BootedSlotFunc != nil {
+		return strings.ToUpper(strings.TrimSpace(u.BootedSlotFunc()))
+	}
+	return ReadBootedSlotFromCmdline("/proc/cmdline")
 }
 
 func (u *ABUpdater) LoadState() ABSlotState {
@@ -127,6 +168,10 @@ func (u *ABUpdater) LoadState() ABSlotState {
 		LastKnownGoodSlot: "A",
 		CurrentVersion:    u.CurrentVersion,
 		HealthConfirmed:   true,
+	}
+	if bSlot := u.bootedSlot(); bSlot == "A" || bSlot == "B" {
+		st.ActiveSlot = bSlot
+		st.LastKnownGoodSlot = bSlot
 	}
 	if u.StatePath == "" {
 		return st
@@ -145,6 +190,34 @@ func (u *ABUpdater) LoadState() ABSlotState {
 	return st
 }
 
+func atomicWriteFileFsync(path string, data []byte, perm os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	_ = os.Remove(tmp)
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_EXCL, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	_ = f.Chmod(perm)
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
 func (u *ABUpdater) saveState(st ABSlotState) error {
 	if u.StatePath == "" {
 		return nil
@@ -154,37 +227,24 @@ func (u *ABUpdater) saveState(st ABSlotState) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(u.StatePath), 0o700); err != nil {
-		return err
-	}
-	tmp := u.StatePath + ".tmp"
-	if err := os.WriteFile(tmp, append(b, '\n'), 0o600); err != nil {
-		return err
-	}
-	_ = os.Chmod(tmp, 0o600)
-	return os.Rename(tmp, u.StatePath)
+	return atomicWriteFileFsync(u.StatePath, append(b, '\n'), 0o600)
 }
 
 func (u *ABUpdater) writeBootEnv(nextSlot string, tries int) error {
 	if u.BootEnvPath == "" {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(u.BootEnvPath), 0o700); err != nil {
-		return err
-	}
 	content := fmt.Sprintf("RINGWALL_BOOT_SLOT=%s\nRINGWALL_BOOT_TRIES=%d\n", nextSlot, tries)
-	tmp := u.BootEnvPath + ".tmp"
-	if err := os.WriteFile(tmp, []byte(content), 0o600); err != nil {
-		return err
-	}
-	_ = os.Chmod(tmp, 0o600)
-	return os.Rename(tmp, u.BootEnvPath)
+	return atomicWriteFileFsync(u.BootEnvPath, []byte(content), 0o600)
 }
 
 // StageUpdate verifies the signed manifest, downloads & SHA-256 verifies the image into the inactive slot,
 // and arms the boot-counter so the next reboot tests the new slot with automatic rollback protection.
 func (u *ABUpdater) StageUpdate(ctx context.Context, m ABManifest) (ABSlotState, error) {
 	st := u.LoadState()
+	if !u.Enabled {
+		return st, errors.New("A/B immutable updates are disabled in config (patcher.ab_update.enabled: false)")
+	}
 	curVer := st.CurrentVersion
 	if curVer == "" {
 		curVer = u.CurrentVersion
@@ -203,10 +263,25 @@ func (u *ABUpdater) StageUpdate(ctx context.Context, m ABManifest) (ABSlotState,
 		return st, errors.New("inactive A/B slot path not configured")
 	}
 
-	client := u.HTTPClient
-	if client == nil {
-		client = &http.Client{Timeout: 5 * time.Minute}
+	var baseTransport http.RoundTripper
+	timeout := 5 * time.Minute
+	if u.HTTPClient != nil {
+		baseTransport = u.HTTPClient.Transport
+		if u.HTTPClient.Timeout > 0 {
+			timeout = u.HTTPClient.Timeout
+		}
 	}
+	client := &http.Client{
+		Transport: baseTransport,
+		Timeout:   timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return errors.New("too many redirects")
+			}
+			return validateABURL(req.URL.String())
+		},
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.ReleaseURL, nil)
 	if err != nil {
 		return st, err
@@ -224,18 +299,29 @@ func (u *ABUpdater) StageUpdate(ctx context.Context, m ABManifest) (ABSlotState,
 	if err := os.MkdirAll(filepath.Dir(targetPath), 0o700); err != nil {
 		return st, err
 	}
+	// Reject symlink target paths before staging.
+	if linfo, err := os.Lstat(targetPath); err == nil && linfo.Mode()&os.ModeSymlink != 0 {
+		return st, fmt.Errorf("refusing to write A/B image to symlink %q", targetPath)
+	}
+
 	tmpPath := targetPath + ".staging"
-	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	_ = os.Remove(tmpPath)
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
 	if err != nil {
 		return st, err
 	}
 
 	h := sha256.New()
 	written, copyErr := io.Copy(io.MultiWriter(f, h), io.LimitReader(resp.Body, m.ImageSize+1))
+	syncErr := f.Sync()
 	closeErr := f.Close()
 	if copyErr != nil {
 		_ = os.Remove(tmpPath)
 		return st, fmt.Errorf("stream image: %w", copyErr)
+	}
+	if syncErr != nil {
+		_ = os.Remove(tmpPath)
+		return st, syncErr
 	}
 	if closeErr != nil {
 		_ = os.Remove(tmpPath)
@@ -269,14 +355,20 @@ func (u *ABUpdater) StageUpdate(ctx context.Context, m ABManifest) (ABSlotState,
 	return st, nil
 }
 
-// ConfirmBootHealth runs after startup on a pending slot:
-// - healthOK=true promotes PendingSlot to ActiveSlot & LastKnownGoodSlot.
-// - healthOK=false decrements TriesRemaining and automatically rolls boot-env back to LastKnownGoodSlot once exhausted.
+// ConfirmBootHealth runs on startup ONLY when the kernel actually booted into PendingSlot
+// (verified via ringwall.slot=... from /proc/cmdline). A plain daemon restart while still
+// booted in the old slot is a safe no-op and never promotes or disarms rollback (P1-5).
 func (u *ABUpdater) ConfirmBootHealth(healthOK bool) (ABSlotState, bool, error) {
 	st := u.LoadState()
-	if st.PendingSlot == "" {
+	if !u.Enabled || st.PendingSlot == "" {
 		return st, false, nil
 	}
+	booted := u.bootedSlot()
+	if booted == "" || booted != st.PendingSlot {
+		// Still running in the previous slot (e.g. systemctl restart before reboot): do NOT promote!
+		return st, false, nil
+	}
+
 	if healthOK {
 		st.ActiveSlot = st.PendingSlot
 		st.LastKnownGoodSlot = st.PendingSlot

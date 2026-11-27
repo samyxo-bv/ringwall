@@ -170,7 +170,7 @@ func Default() *Config {
 			AutoFixDrift:         true,
 			RestartStaleServices: true,
 			AIVirtualPatch:       true,
-			VirtualPatchFile:     "/etc/ringwall/policies.d/99-virtual-patches.yaml",
+			VirtualPatchFile:     "/var/lib/ringwall/virtual-patches.json",
 			ABUpdate: ABUpdateConfig{
 				Enabled:     false,
 				StatePath:   "/var/lib/ringwall/ab-state.json",

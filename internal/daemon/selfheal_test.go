@@ -38,7 +38,7 @@ func TestDaemonSelfHealingScanPatchVirtualPatchAndLSMBlockedIncident(t *testing.
 	cfg.AuditLogPath = filepath.Join(dir, "audit.jsonl")
 	cfg.AI.Enabled = false
 	cfg.Patcher.Mode = "auto_critical"
-	cfg.Patcher.VirtualPatchFile = filepath.Join(dir, "99-virtual-patches.yaml")
+	cfg.Patcher.VirtualPatchFile = filepath.Join(dir, "virtual-patches.json")
 	cfg.Patcher.AutoFixDrift = false // avoid touching host /proc/sys in unit tests
 
 	pol, err := policy.NewEngine(nil)

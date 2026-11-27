@@ -31,7 +31,7 @@ patcher:
   auto_fix_drift: true
   restart_stale_services: true
   ai_virtual_patch: true
-  virtual_patch_file: /etc/ringwall/policies.d/99-virtual-patches.yaml
+  virtual_patch_file: /var/lib/ringwall/virtual-patches.json
   ab_update:
     enabled: false
     state_path: /var/lib/ringwall/ab-state.json

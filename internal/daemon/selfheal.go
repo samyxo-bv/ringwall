@@ -39,8 +39,14 @@ func (d *Daemon) initSelfHealing(cfg *config.Config) {
 	d.scanner = sc
 	if d.vpatches == nil {
 		d.vpatches = patcher.NewVirtualPatchManager(d.policy, blocker, cfg.Patcher.VirtualPatchFile)
+		if loaded, err := d.vpatches.LoadPersisted(); err != nil {
+			log.Printf("ringwall: load persisted virtual patches failed: %v", err)
+		} else if loaded > 0 {
+			log.Printf("ringwall: restored %d active virtual patch(es) from %s", loaded, cfg.Patcher.VirtualPatchFile)
+		}
 	}
 	d.abUpdater = &patcher.ABUpdater{
+		Enabled:        cfg.Patcher.ABUpdate.Enabled,
 		StatePath:      cfg.Patcher.ABUpdate.StatePath,
 		BootEnvPath:    cfg.Patcher.ABUpdate.BootEnvPath,
 		SlotAPath:      cfg.Patcher.ABUpdate.SlotAPath,
@@ -69,7 +75,7 @@ func (d *Daemon) confirmStartupABHealth() {
 	d.selfHealMu.RLock()
 	up := d.abUpdater
 	d.selfHealMu.RUnlock()
-	if up == nil || up.StatePath == "" {
+	if up == nil || !up.Enabled || up.StatePath == "" {
 		return
 	}
 	st := up.LoadState()
@@ -81,6 +87,9 @@ func (d *Daemon) confirmStartupABHealth() {
 	if err != nil {
 		log.Printf("ringwall: A/B boot health confirmation failed: %v", err)
 		return
+	}
+	if next.PendingSlot == st.PendingSlot && !rolledBack {
+		return // Still booted in previous slot (daemon restart without reboot): nothing changed
 	}
 	kind := "ab.boot_confirmed"
 	if rolledBack {
@@ -122,7 +131,7 @@ func (d *Daemon) RunScan(ctx context.Context) scanner.ScanReport {
 
 	var revoked []string
 	if vpMgr != nil {
-		revoked = vpMgr.Reconcile(rep.Findings, time.Now().UTC())
+		revoked = vpMgr.Reconcile(rep, time.Now().UTC())
 	}
 
 	d.selfHealMu.Lock()
@@ -158,6 +167,9 @@ func (d *Daemon) LastScan() *scanner.ScanReport {
 // RunPatchCycle runs deterministic auto-patching (when enabled), stale-service restarts,
 // sysctl/perm drift fixes, and AI/deterministic zero-day virtual patching with strict anti-lockout guardrails.
 func (d *Daemon) RunPatchCycle(ctx context.Context, dryRunOverride *bool) patcher.ApplySummary {
+	d.patchMu.Lock()
+	defer d.patchMu.Unlock()
+
 	cfg := d.Config()
 	mode := patcher.Mode(cfg.Patcher.Mode)
 	dryRun := cfg.Patcher.DryRun
@@ -183,7 +195,7 @@ func (d *Daemon) RunPatchCycle(ctx context.Context, dryRunOverride *bool) patche
 		VirtualPatchesRevoked: []string{},
 	}
 
-	if mode == patcher.ModeOff && dryRunOverride == nil {
+	if mode == patcher.ModeOff {
 		d.recordAudit("patcher.skipped_off", summary)
 		return summary
 	}
@@ -242,7 +254,7 @@ func (d *Daemon) RunPatchCycle(ctx context.Context, dryRunOverride *bool) patche
 			}
 			summary.VirtualPatchesApplied = append(summary.VirtualPatchesApplied, applied)
 		}
-		summary.VirtualPatchesRevoked = vpMgr.Reconcile(rep.Findings, time.Now().UTC())
+		summary.VirtualPatchesRevoked = vpMgr.Reconcile(rep, time.Now().UTC())
 	}
 
 	d.selfHealMu.Lock()

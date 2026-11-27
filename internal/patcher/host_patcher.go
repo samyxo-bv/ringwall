@@ -65,7 +65,7 @@ func IsProtectedUnit(unit string) bool {
 	if protectedUnits[unit] {
 		return true
 	}
-	if strings.HasPrefix(unit, "getty@") || strings.HasPrefix(unit, "serial-getty@") || strings.HasPrefix(unit, "systemd-") {
+	if strings.HasPrefix(unit, "getty@") || strings.HasPrefix(unit, "serial-getty@") || strings.HasPrefix(unit, "systemd-") || strings.HasPrefix(unit, "user@") {
 		return true
 	}
 	return false

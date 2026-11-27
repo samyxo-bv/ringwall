@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Ringwall Linux eBPF LSM + tracing + tracepoint sensor (v0.2).
 // Tier 1 (kernels with BPF LSM active, e.g. Ringwall ISO):
-//   - lsm/file_open: synchronous -EPERM pre-read kernel blocking on SSH private keys & pinned secret inodes
-//     (defeats hardlinks, source-renames, and /tmp/ssh comm spoofing via kernel exe inode allowlist) + bpf_d_path.
+//   - lsm/file_open: FAIL-CLOSED synchronous -EPERM pre-read kernel blocking on SSH private keys &
+//     pinned secret inodes (computed BEFORE ringbuf reserve so ringbuf floods NEVER fail open).
+//   - lsm/mmap_file + BPF_MAP_TYPE_TASK_STORAGE: taints allowlisted ssh/ssh-keygen processes that
+//     map non-root-owned or world-writable PROT_EXEC objects (defeats LD_PRELOAD / PKCS11Provider).
+//   - lsm/ptrace_access_check: blocks non-root ptrace into allowlisted ssh processes.
 //   - lsm/bprm_check_security: synchronous -EPERM execution blocking for zero-day virtual-patched binaries.
 // Tier 2 (BTF kernels without lsm=...,bpf): fentry/security_file_open + bpf_d_path.
 // Tier 3 (older kernels): hardened syscall open tracepoints.
@@ -12,17 +15,31 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+#ifndef BPF_LOCAL_STORAGE_GET_F_CREATE
+#define BPF_LOCAL_STORAGE_GET_F_CREATE 1
+#endif
+
+#ifndef PROT_EXEC
+#define PROT_EXEC 0x4
+#endif
+
 // Minimal CO-RE kernel VFS/task structs.
 // Placing f_flags before f_path ensures f_path has a non-zero stub offset so Clang always emits
 // a CO-RE BPF_FIELD_BYTE_OFFSET relocation for bpf_d_path(&file->f_path, ...).
 struct vfsmount;
 struct dentry;
 
+typedef struct {
+    __u32 val;
+} __attribute__((preserve_access_index)) kuid_t;
+
 struct super_block {
     __u32 s_dev;
 } __attribute__((preserve_access_index));
 
 struct inode {
+    __u16 i_mode;
+    kuid_t i_uid;
     unsigned long i_ino;
     struct super_block *i_sb;
 } __attribute__((preserve_access_index));
@@ -100,6 +117,10 @@ struct file_key {
     __u32 _pad;
 };
 
+struct path_buf {
+    char data[PATH_MAX_LEN];
+};
+
 // Kernel sys_enter tracepoint ABI layout on 64-bit Linux.
 struct sys_enter_ctx {
     __u64 common;
@@ -111,6 +132,15 @@ struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 4 << 20); // 4 MiB ring buffer
 } events SEC(".maps");
+
+// Per-CPU 256-byte scratch buffer so lsm/file_open resolves paths and decides should_block
+// BEFORE attempting bpf_ringbuf_reserve (guarantees fail-closed -EPERM even under ringbuf floods).
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct path_buf);
+} path_scratch_map SEC(".maps");
 
 // Index 0: ringwalld's own PID (never self-triggers or self-blocks).
 // Index 1: enforce_lsm (0 = monitor/audit only, 1 = synchronous -EPERM kernel blocking active).
@@ -136,6 +166,15 @@ struct {
     __type(key, struct file_key);
     __type(value, __u32);
 } allowed_ssh_exe_inodes SEC(".maps");
+
+// Per-task taint flag set by lsm/mmap_file when an allowlisted SSH binary loads a non-root or
+// world-writable PROT_EXEC object (defeats LD_PRELOAD & PKCS11Provider hijacks).
+struct {
+    __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, int);
+    __type(value, __u32);
+} task_taint_map SEC(".maps");
 
 // Pinned secret file inodes (defeats hardlink & source-rename bypasses synchronously in lsm/file_open).
 struct {
@@ -167,6 +206,15 @@ static __always_inline void init_event(struct ringwall_event *e) {
     #pragma unroll
     for (int i = 0; i < MAX_ARGS; i++) {
         e->argv[i][0] = '\0';
+    }
+}
+
+static __always_inline void copy_path_256(char *dst, const char *src) {
+    __u64 *d = (__u64 *)dst;
+    const __u64 *s = (const __u64 *)src;
+    #pragma clang loop unroll(disable)
+    for (int i = 0; i < PATH_MAX_LEN / 8; i++) {
+        d[i] = s[i];
     }
 }
 
@@ -211,8 +259,7 @@ static __always_inline int get_file_key(struct file *file, struct file_key *out)
     return 1;
 }
 
-static __always_inline int is_allowed_ssh_exe(void) {
-    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+static __always_inline int is_task_exe_allowlisted(struct task_struct *task) {
     if (!task) {
         return 0;
     }
@@ -231,6 +278,19 @@ static __always_inline int is_allowed_ssh_exe(void) {
         return 0;
     }
     return bpf_map_lookup_elem(&allowed_ssh_exe_inodes, &ek) != 0 ? 1 : 0;
+}
+
+static __always_inline int is_allowed_ssh_exe(void) {
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+    if (!is_task_exe_allowlisted(task)) {
+        return 0;
+    }
+    // Revoke exemption if process mapped any non-root or world-writable PROT_EXEC library (LD_PRELOAD / PKCS11).
+    __u32 *taint = bpf_task_storage_get(&task_taint_map, task, 0, 0);
+    if (taint && *taint != 0) {
+        return 0;
+    }
+    return 1;
 }
 
 static __always_inline int starts_with_4(const char *s, char a, char b, char c, char d) {
@@ -543,6 +603,8 @@ static __always_inline int emit_sockaddr(__u32 ev_type, const void *user_addr, l
 }
 
 // Tier 1: Synchronous eBPF LSM file_open hook (pre-read -EPERM kernel enforcement + bpf_d_path).
+// Evaluates should_block in a per-CPU scratch buffer BEFORE reserving ringbuf space so even a
+// deliberate ringbuf flood NEVER fails open (P1-1) and ordinary opens avoid ringbuf churn (P2).
 SEC("lsm/file_open")
 int trace_lsm_file_open(__u64 *ctx) {
     struct file *file = (struct file *)ctx[0];
@@ -555,19 +617,16 @@ int trace_lsm_file_open(__u64 *ctx) {
         return 0;
     }
 
-    struct ringwall_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-    if (!e) {
-        record_drop();
+    __u32 zero = 0;
+    struct path_buf *pb = bpf_map_lookup_elem(&path_scratch_map, &zero);
+    if (!pb) {
         return 0;
     }
+    pb->data[0] = '\0';
 
-    init_event(e);
     __u32 flags = file->f_flags;
-    e->flags = flags;
-    e->dirfd = AT_FDCWD;
-
-    long n = bpf_d_path(__builtin_preserve_access_index(&file->f_path), e->path, sizeof(e->path));
-    int path_ok = (n > 1 && e->path[0] == '/');
+    long n = bpf_d_path(__builtin_preserve_access_index(&file->f_path), pb->data, PATH_MAX_LEN);
+    int path_ok = (n > 1 && pb->data[0] == '/');
 
     int should_block = 0;
     if (is_lsm_enforce_enabled()) {
@@ -576,26 +635,86 @@ int trace_lsm_file_open(__u64 *ctx) {
             if (!is_allowed_ssh_exe()) {
                 should_block = 1;
             }
-        } else if (path_ok && is_ssh_private_key_path(e->path)) {
+        } else if (path_ok && is_ssh_private_key_path(pb->data)) {
             if (!is_allowed_ssh_exe()) {
                 should_block = 1;
             }
         }
     }
 
-    if (!should_block && (!path_ok || !is_interesting_resolved_path(e->path, flags))) {
-        bpf_ringbuf_discard(e, 0);
+    if (!should_block && (!path_ok || !is_interesting_resolved_path(pb->data, flags))) {
         return 0;
     }
 
+    struct ringwall_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e) {
+        record_drop();
+        // FAIL-CLOSED: even under ringbuf saturation, synchronous -EPERM STILL enforces!
+        return should_block ? -1 : 0;
+    }
+
+    init_event(e);
     e->type = should_block ? EVENT_OPEN_BLOCKED : EVENT_OPEN_RESOLVED;
     e->pid = pid;
     e->uid = (__u32)bpf_get_current_uid_gid();
+    e->flags = flags;
+    e->dirfd = AT_FDCWD;
+    if (path_ok) {
+        copy_path_256(e->path, pb->data);
+    }
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
-
     bpf_ringbuf_submit(e, 0);
-    if (should_block) {
-        return -1; // -EPERM: blocked synchronously before a single byte is read
+
+    return should_block ? -1 : 0;
+}
+
+// Tier 1: Taint allowlisted SSH binaries that mmap non-root or world-writable PROT_EXEC objects
+// (defeats LD_PRELOAD=~/x.so ssh-keygen and ssh -o PKCS11Provider=~/x.so hijacks).
+SEC("lsm/mmap_file")
+int trace_lsm_mmap_file(__u64 *ctx) {
+    struct file *file = (struct file *)ctx[0];
+    unsigned long reqprot = (unsigned long)ctx[1];
+    unsigned long prot = (unsigned long)ctx[2];
+    int ret = (int)ctx[4];
+    if (ret != 0 || !file || !((reqprot | prot) & PROT_EXEC)) {
+        return ret;
+    }
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+    if (!is_task_exe_allowlisted(task)) {
+        return 0;
+    }
+    struct inode *ino_p = 0;
+    bpf_probe_read_kernel(&ino_p, sizeof(ino_p), __builtin_preserve_access_index(&file->f_inode));
+    if (!ino_p) {
+        return 0;
+    }
+    __u32 owner_uid = 0;
+    __u16 mode = 0;
+    bpf_probe_read_kernel(&owner_uid, sizeof(owner_uid), __builtin_preserve_access_index(&ino_p->i_uid.val));
+    bpf_probe_read_kernel(&mode, sizeof(mode), __builtin_preserve_access_index(&ino_p->i_mode));
+    if (owner_uid != 0 || (mode & 0002)) {
+        __u32 one = 1;
+        __u32 *slot = bpf_task_storage_get(&task_taint_map, task, &one, BPF_LOCAL_STORAGE_GET_F_CREATE);
+        if (slot) {
+            *slot = 1;
+        }
+    }
+    return 0;
+}
+
+// Tier 1: Prevent non-root ptrace injection into allowlisted SSH binaries (even when yama.ptrace_scope <= 1).
+SEC("lsm/ptrace_access_check")
+int trace_lsm_ptrace_access_check(__u64 *ctx) {
+    struct task_struct *child = (struct task_struct *)ctx[0];
+    int ret = (int)ctx[2];
+    if (ret != 0 || !child || !is_lsm_enforce_enabled()) {
+        return ret;
+    }
+    if ((__u32)bpf_get_current_uid_gid() == 0) {
+        return 0;
+    }
+    if (is_task_exe_allowlisted(child)) {
+        return -1; // -EPERM
     }
     return 0;
 }
@@ -648,6 +767,19 @@ int trace_security_file_open(__u64 *ctx) {
         return 0;
     }
 
+    __u32 zero = 0;
+    struct path_buf *pb = bpf_map_lookup_elem(&path_scratch_map, &zero);
+    if (!pb) {
+        return 0;
+    }
+    pb->data[0] = '\0';
+
+    __u32 flags = file->f_flags;
+    long n = bpf_d_path(__builtin_preserve_access_index(&file->f_path), pb->data, PATH_MAX_LEN);
+    if (n <= 1 || !is_interesting_resolved_path(pb->data, flags)) {
+        return 0;
+    }
+
     struct ringwall_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) {
         record_drop();
@@ -655,19 +787,12 @@ int trace_security_file_open(__u64 *ctx) {
     }
 
     init_event(e);
-    __u32 flags = file->f_flags;
-    e->flags = flags;
-    e->dirfd = AT_FDCWD;
-
-    long n = bpf_d_path(__builtin_preserve_access_index(&file->f_path), e->path, sizeof(e->path));
-    if (n <= 1 || !is_interesting_resolved_path(e->path, flags)) {
-        bpf_ringbuf_discard(e, 0);
-        return 0;
-    }
-
     e->type = EVENT_OPEN_RESOLVED;
     e->pid = pid;
     e->uid = (__u32)bpf_get_current_uid_gid();
+    e->flags = flags;
+    e->dirfd = AT_FDCWD;
+    copy_path_256(e->path, pb->data);
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
 
     bpf_ringbuf_submit(e, 0);

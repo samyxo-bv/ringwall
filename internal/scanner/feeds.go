@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -109,9 +110,9 @@ type osvVulnDetail struct {
 	} `json:"affected"`
 }
 
-func queryOSV(ctx context.Context, client *http.Client, baseURL string, pkgs []InstalledPackage) ([]Finding, error) {
+func queryOSV(ctx context.Context, client *http.Client, baseURL string, pkgs []InstalledPackage) ([]Finding, bool, error) {
 	if err := validateHTTPSFeedURL(baseURL); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	baseURL = strings.TrimRight(baseURL, "/")
 
@@ -138,29 +139,29 @@ func queryOSV(ctx context.Context, client *http.Client, baseURL string, pkgs []I
 		}
 		payload, err := json.Marshal(reqBody)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/querybatch", bytes.NewReader(payload))
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("User-Agent", "Ringwall-Scanner/0.2")
 		resp, err := client.Do(req)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxFeedResponseLen))
 		resp.Body.Close()
 		if readErr != nil {
-			return nil, readErr
+			return nil, false, readErr
 		}
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("OSV querybatch HTTP %d", resp.StatusCode)
+			return nil, false, fmt.Errorf("OSV querybatch HTTP %d", resp.StatusCode)
 		}
 		var br osvBatchResp
 		if err := json.Unmarshal(body, &br); err != nil {
-			return nil, fmt.Errorf("decode OSV querybatch: %w", err)
+			return nil, false, fmt.Errorf("decode OSV querybatch: %w", err)
 		}
 		for i, res := range br.Results {
 			if i >= len(chunk) {
@@ -176,28 +177,41 @@ func queryOSV(ctx context.Context, client *http.Client, baseURL string, pkgs []I
 		}
 	}
 
-	// Fetch detailed metadata (aliases/CVE, fixed version, severity) bounded to at most 80 unique vulns per scan.
-	details := make(map[string]osvVulnDetail, len(uniqueIDs))
-	fetched := 0
+	// Deterministic sorted fetch order; mark truncated=true if capped so auto-revoke fails closed.
+	sortedIDs := make([]string, 0, len(uniqueIDs))
 	for id := range uniqueIDs {
-		if fetched >= 80 {
-			break
-		}
-		fetched++
+		sortedIDs = append(sortedIDs, id)
+	}
+	sort.Strings(sortedIDs)
+
+	const maxDetailFetch = 150
+	truncated := len(sortedIDs) > maxDetailFetch
+	if truncated {
+		sortedIDs = sortedIDs[:maxDetailFetch]
+	}
+
+	details := make(map[string]osvVulnDetail, len(sortedIDs))
+	for _, id := range sortedIDs {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/v1/vulns/"+url.PathEscape(id), nil)
 		if err != nil {
+			truncated = true
 			continue
 		}
 		req.Header.Set("User-Agent", "Ringwall-Scanner/0.2")
 		resp, err := client.Do(req)
 		if err != nil {
+			truncated = true
 			continue
 		}
 		if resp.StatusCode == http.StatusOK {
 			var d osvVulnDetail
 			if json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&d) == nil {
 				details[id] = d
+			} else {
+				truncated = true
 			}
+		} else {
+			truncated = true
 		}
 		resp.Body.Close()
 	}
@@ -225,7 +239,7 @@ func queryOSV(ctx context.Context, client *http.Client, baseURL string, pkgs []I
 			SourceFeed:       "osv",
 		})
 	}
-	return findings, nil
+	return findings, truncated, nil
 }
 
 func loadOfflineBundle(path string) (*OfflineBundle, error) {
@@ -261,7 +275,8 @@ func extractFixedVersion(d osvVulnDetail, pkgName, ecosystem string) string {
 		if aff.Package.Name != "" && aff.Package.Name != pkgName {
 			continue
 		}
-		if aff.Package.Ecosystem != "" && ecosystem != "" && !strings.HasPrefix(aff.Package.Ecosystem, strings.Split(ecosystem, ":")[0]) {
+		// Match exact release ecosystem (e.g. Debian:12 != Debian:11).
+		if aff.Package.Ecosystem != "" && ecosystem != "" && !strings.EqualFold(aff.Package.Ecosystem, ecosystem) {
 			continue
 		}
 		for _, r := range aff.Ranges {
@@ -363,11 +378,15 @@ func CompareVersions(a, b string) int {
 		if sa == sb {
 			continue
 		}
-		// Tilde (~) sorts strictly before everything (including empty string) per Debian policy.
-		if strings.HasPrefix(sa, "~") && !strings.HasPrefix(sb, "~") {
+		// Tilde (~) and semver prerelease tags (-rc, -alpha, -beta) sort strictly before release.
+		isPre := func(s string) bool {
+			sl := strings.ToLower(s)
+			return strings.HasPrefix(sl, "~") || sl == "rc" || sl == "alpha" || sl == "beta" || sl == "pre"
+		}
+		if isPre(sa) && !isPre(sb) {
 			return -1
 		}
-		if !strings.HasPrefix(sa, "~") && strings.HasPrefix(sb, "~") {
+		if !isPre(sa) && isPre(sb) {
 			return 1
 		}
 		na, erra := strconv.ParseInt(sa, 10, 64)

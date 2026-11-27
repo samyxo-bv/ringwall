@@ -200,7 +200,8 @@ func parseVirtualPatchJSON(raw string) (*VirtualPatchProposal, error) {
 		return nil, err
 	}
 	act := normalizeAction(parsed.Action)
-	if act == model.ActionAllow || act == model.ActionWarn {
+	// AI virtual patch proposals are strictly limited to freeze or block_egress (never kill).
+	if act != model.ActionFreeze && act != model.ActionBlockEgress {
 		act = model.ActionFreeze
 	}
 	ttl := parsed.TTLHours

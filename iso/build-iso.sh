@@ -201,7 +201,7 @@ terminal_input console serial
 terminal_output console serial
 
 menuentry "Ringwall Hardened Immutable Appliance (eBPF LSM + Local AI Guardian)" {
-    linux /live/vmlinuz boot=live components quiet console=tty0 console=ttyS0,115200n8 lsm=lockdown,yama,integrity,apparmor,bpf lockdown=integrity init_on_alloc=1 init_on_free=1 slab_nomerge pti=on randomize_kstack_offset=on
+    linux /live/vmlinuz boot=live components quiet console=tty0 console=ttyS0,115200n8 lsm=lockdown,yama,integrity,apparmor,bpf ringwall.slot=A lockdown=integrity init_on_alloc=1 init_on_free=1 slab_nomerge pti=on randomize_kstack_offset=on
     initrd /live/initrd.img
 }
 EOF

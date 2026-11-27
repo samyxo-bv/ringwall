@@ -314,7 +314,7 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, rep)
 			return
 		}
-		writeJSON(w, http.StatusOK, s.daemon.RunScan(r.Context()))
+		writeJSON(w, http.StatusOK, map[string]any{"scanned": false})
 	case http.MethodPost:
 		writeJSON(w, http.StatusOK, s.daemon.RunScan(r.Context()))
 	default:

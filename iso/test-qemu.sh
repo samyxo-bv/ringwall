@@ -18,7 +18,8 @@ set -euo pipefail
 # 12. N3 destructive rm bypasses ('rm --r /usr' AND 'cd / && rm -r usr') are frozen (State: T).
 # 13. Live reverse-shell bash (/dev/tcp) is frozen (State: T).
 # 14. Signed Ed25519 A/B manifest keygen + sign + verify + tamper-rejection works live inside ISO.
-# 15. Provider catalog is available and real incidents are recorded with 0 drops.
+# 15. Provider catalog is available and real incidents are recorded with 0 drops under normal load.
+# 16. P1-1 FAIL-CLOSED UNDER RINGBUF FLOOD: concurrent UDP sendto flood still returns EPERM (0 bytes leaked!).
 #
 # Usage: ./iso/test-qemu.sh dist/ringwall-appliance-amd64.iso
 
@@ -107,18 +108,19 @@ def run_cmd(shell_cmd: str, timeout: float = 45.0) -> str:
 try:
     boot_timeout = 240.0 if "-enable-kvm" not in kvm_args else 90.0
     read_until(b"operator@ringwall", boot_timeout)
-    print("\n[qemu-e2e] Boot complete! Running 15 live LSM + self-healing security assertions...\n", flush=True)
+    print("\n[qemu-e2e] Boot complete! Running 16 live LSM + self-healing security assertions...\n", flush=True)
 
     # 1. Read-only SquashFS lower rootfs & no SSH server
     out = run_cmd("mount | grep -E 'squashfs.*\\bro\\b' && test ! -x /usr/sbin/sshd && echo \"BASE_HARDENED\"\"_OK\"")
     assert "BASE_HARDENED_OK" in out, f"Expected ro squashfs + no sshd, got:\n{out}"
 
-    # 2. Wait for ringwalld public health snapshot and verify live eBPF LSM blocking
-    out = run_cmd("for i in $(seq 1 30); do [ -r /run/ringwall-status/status.json ] && break; sleep 1; done; cat /run/ringwall-status/status.json; echo LSM_ACTIVE=$(cat /sys/kernel/security/lsm)", timeout=60.0)
+    # 2. Wait for ringwalld public health snapshot and verify live eBPF LSM blocking + ringwall.slot=A
+    out = run_cmd("for i in $(seq 1 30); do [ -r /run/ringwall-status/status.json ] && break; sleep 1; done; cat /run/ringwall-status/status.json; echo LSM_ACTIVE=$(cat /sys/kernel/security/lsm); echo CMDLINE=$(cat /proc/cmdline)", timeout=60.0)
     assert '"sensor_mode": "ebpf"' in out, f"Expected live eBPF sensor in ISO, got:\n{out}"
     assert '"open_hook": "lsm/file_open"' in out, f"Expected synchronous lsm/file_open active in ISO, got:\n{out}"
     assert '"lsm_enforce_active": true' in out, f"Expected lsm_enforce_active=true in ISO, got:\n{out}"
     assert '"policy_count": 0' not in out, f"Expected policies loaded, got:\n{out}"
+    assert "ringwall.slot=A" in out, f"Expected ringwall.slot=A on kernel cmdline, got:\n{out}"
 
     # 3. P0-1 PROOF: monitored user 'operator' CANNOT read admin token or audit log and gets HTTP 401
     out = run_cmd(
@@ -277,13 +279,27 @@ try:
     assert "VALID Ed25519 A/B manifest" in out, f"Expected valid A/B manifest verification, got:\n{out}"
     assert "AB_TAMPER_REJECTED" in out, f"Expected tampered A/B manifest rejection, got:\n{out}"
 
-    # 15. Verify non-zero real incidents, 0 drops, and provider catalog works
+    # 15. Verify non-zero real incidents, 0 drops under normal load, and provider catalog works
     out = run_cmd("sleep 2; cat /run/ringwall-status/status.json && ringwallctl providers | grep -q 'Venice.ai' && echo \"PROVIDERS\"\"_OK\"")
     assert '"dropped_events": 0' in out, f"Expected 0 dropped events, got:\n{out}"
     assert '"incidents_total": 0' not in out, f"Expected real incidents recorded, got:\n{out}"
     assert "PROVIDERS_OK" in out, f"Provider catalog missing:\n{out}"
 
-    print("\n[qemu-e2e] ALL 15 LIVE LSM + SELF-HEALING ISO SECURITY ASSERTIONS PASSED!\n", flush=True)
+    # 16. P1-1 FAIL-CLOSED PROOF: saturate eBPF ringbuf via concurrent UDP sendto flood and prove
+    # synchronous -EPERM STILL blocks ~/.ssh/id_ed25519 with ZERO bytes leaked!
+    run_cmd(
+        "FPIDS=''; for i in 1 2 3 4; do "
+        "python3 -c 'import socket, time; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); t=time.time()+4; "
+        "exec(\"while time.time()<t: s.sendto(b\\\"x\\\",(\\\"127.0.0.1\\\",9))\")' >/dev/null 2>&1 & "
+        "FPIDS=\"$FPIDS $!\"; done; echo \"$FPIDS\" > /tmp/flood_pids"
+    )
+    assert_lsm_eperm(
+        "open('/home/operator/.ssh/id_ed25519').read()",
+        "P1-1 ringbuf-flood fail-closed SSH key LSM block",
+    )
+    run_cmd("kill -9 $(cat /tmp/flood_pids 2>/dev/null) 2>/dev/null || true; rm -f /tmp/flood_pids")
+
+    print("\n[qemu-e2e] ALL 16 LIVE LSM + SELF-HEALING ISO SECURITY ASSERTIONS PASSED!\n", flush=True)
 finally:
     proc.terminate()
     try:

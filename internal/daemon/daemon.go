@@ -64,6 +64,7 @@ type Daemon struct {
 	subscribers map[chan model.Incident]struct{}
 
 	selfHealMu sync.RWMutex
+	patchMu    sync.Mutex
 	scanner    *scanner.Scanner
 	vpatches   *patcher.VirtualPatchManager
 	abUpdater  *patcher.ABUpdater

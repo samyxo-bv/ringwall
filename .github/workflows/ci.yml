@@ -45,9 +45,10 @@ jobs:
       - name: Validate built-in YAML policy packs
         run: ./bin/ringwallctl policy-check ./policies
 
-      - name: Live root host integration test (eBPF + 0600 token + simulate + audit verify)
+      - name: Live root host integration test (eBPF LSM + LD_PRELOAD taint + bprm virtual-patch + audit verify)
         run: |
           TMPDIR="$(mktemp -d)"
+          chmod 0755 "${TMPDIR}"
           sudo mkdir -p "${TMPDIR}/run" "${TMPDIR}/log"
           cat > "${TMPDIR}/ringwall.yaml" <<EOF
           mode: interactive
@@ -56,9 +57,16 @@ jobs:
           audit_log_path: ${TMPDIR}/log/audit.jsonl
           sensor:
             mode: auto
+            enable_lsm_blocking: true
           enforcer:
             enable_signals: true
             enable_nftables: false
+          patcher:
+            virtual_patch_file: ${TMPDIR}/vpatches.json
+            ab_update:
+              enabled: false
+              state_file: ${TMPDIR}/ab-state.json
+              boot_env_file: ${TMPDIR}/ab-boot.env
           ai:
             enabled: false
           api:
@@ -67,7 +75,7 @@ jobs:
           EOF
           sudo ./bin/ringwalld -config "${TMPDIR}/ringwall.yaml" 2>"${TMPDIR}/daemon.log" &
           DPID=$!
-          trap "cat ${TMPDIR}/daemon.log || true; sudo kill $DPID 2>/dev/null || true" EXIT
+          trap "cat ${TMPDIR}/daemon.log || true; sudo kill $DPID 2>/dev/null || true; rm -rf ${TMPDIR}" EXIT
           for i in $(seq 1 20); do sudo test -f "${TMPDIR}/run/api.token" && break; sleep 0.5; done
           PERM="$(sudo stat -c '%a' "${TMPDIR}/run/api.token")"
           test "${PERM}" = "600"
@@ -80,6 +88,57 @@ jobs:
           ./bin/ringwallctl ab-keygen "${TMPDIR}/ab"
           ./bin/ringwallctl ab-sign "${TMPDIR}/ab.priv" v0.2.0 https://example.com/ringwall.iso ./bin/ringwallctl "${TMPDIR}/ab-manifest.json"
           ./bin/ringwallctl ab-verify "${TMPDIR}/ab.pub" "${TMPDIR}/ab-manifest.json" v0.1.0
+
+          if grep -q "attached lsm/file_open" "${TMPDIR}/daemon.log"; then
+            # Live P1-2 proof: LD_PRELOAD into allowlisted /usr/bin/ssh-keygen taints task via lsm/mmap_file -> EPERM!
+            grep -q "attached lsm/mmap_file" "${TMPDIR}/daemon.log"
+            grep -q "attached lsm/ptrace_access_check" "${TMPDIR}/daemon.log"
+            grep -q "attached lsm/bprm_check_security" "${TMPDIR}/daemon.log"
+            mkdir -p "${TMPDIR}/ldp/.ssh"
+            printf 'RINGWALL-LDP-DECOY\n' > "${TMPDIR}/ldp/.ssh/id_ed25519"
+            cat > "${TMPDIR}/ldp/evil.c" <<'CEOF'
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <unistd.h>
+          __attribute__((constructor)) static void steal(void) {
+              const char *p = getenv("RW_TARGET_KEY");
+              if (!p) _exit(90);
+              int fd = open(p, O_RDONLY);
+              if (fd < 0) {
+                  dprintf(2, "LDP_ERRNO=%d\n", errno);
+                  _exit(42);
+              }
+              close(fd);
+              dprintf(2, "LDP_LEAKED=1\n");
+              _exit(43);
+          }
+          CEOF
+            clang -shared -fPIC -O2 "${TMPDIR}/ldp/evil.c" -o "${TMPDIR}/ldp/evil.so"
+            LDP_OUT="$(RW_TARGET_KEY="${TMPDIR}/ldp/.ssh/id_ed25519" LD_PRELOAD="${TMPDIR}/ldp/evil.so" /usr/bin/ssh-keygen -l -f /dev/null 2>&1 || true)"
+            echo "${LDP_OUT}"
+            echo "${LDP_OUT}" | grep -q "LDP_ERRNO=1"
+            ! echo "${LDP_OUT}" | grep -q "LDP_LEAKED=1"
+
+            # Live lsm/bprm_check_security proof: virtual-patched binary blocked pre-exec -> unblocked on DELETE!
+            TOKEN="$(sudo cat "${TMPDIR}/run/api.token")"
+            cp /bin/true "${TMPDIR}/vp-target-bin"
+            chmod 0755 "${TMPDIR}/vp-target-bin"
+            "${TMPDIR}/vp-target-bin"
+            curl -fsS -X POST -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json" \
+              -d "{\"id\":\"VP-LIVE-TEST\",\"cve\":\"CVE-2099-9999\",\"package\":\"vp-test\",\"target_exe_paths\":[\"${TMPDIR}/vp-target-bin\"],\"action\":\"freeze\",\"source\":\"operator\",\"rationale\":\"live CI LSM bprm verification\"}" \
+              http://127.0.0.1:19443/api/v1/virtual-patches
+            if "${TMPDIR}/vp-target-bin" 2>"${TMPDIR}/vp_err"; then
+              echo "FAIL: virtual-patched binary was NOT blocked by lsm/bprm_check_security!" >&2
+              exit 1
+            fi
+            cat "${TMPDIR}/vp_err"
+            curl -fsS -X DELETE -H "Authorization: Bearer ${TOKEN}" \
+              http://127.0.0.1:19443/api/v1/virtual-patches/VP-LIVE-TEST
+            "${TMPDIR}/vp-target-bin"
+            echo "LIVE_LSM_MMAP_AND_BPRM_PROOFS_OK"
+          fi
 
       - name: Upload compiled Linux binaries
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -123,7 +182,7 @@ jobs:
       - name: Build hardened immutable bootable ISO
         run: sudo ./iso/build-iso.sh --out dist/ringwall-appliance-amd64.iso
 
-      - name: Boot ISO in QEMU & verify 15 live LSM + self-healing security assertions
+      - name: Boot ISO in QEMU & verify 16 live LSM + self-healing security assertions
         run: ./iso/test-qemu.sh dist/ringwall-appliance-amd64.iso
 
       - name: Upload verified bootable ISO

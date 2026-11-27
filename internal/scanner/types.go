@@ -65,21 +65,24 @@ type DriftItem struct {
 
 // ScanReport is the full output of one deterministic security posture & CVE scan.
 type ScanReport struct {
-	ScannedAt       time.Time      `json:"scanned_at"`
-	DurationMS      int64          `json:"duration_ms"`
-	Ecosystem       string         `json:"ecosystem"`
-	KernelRelease   string         `json:"kernel_release,omitempty"`
-	PackageCount    int            `json:"package_count"`
-	Findings        []Finding      `json:"findings"`
-	Drift           []DriftItem    `json:"drift"`
-	StaleProcesses  []StaleProcess `json:"stale_processes"`
-	ImmediateCount  int            `json:"immediate_count"`
-	VirtualCount    int            `json:"virtual_count"`
-	ScheduledCount  int            `json:"scheduled_count"`
-	KEVCount        int            `json:"kev_count"`
-	FeedErrors      []string       `json:"feed_errors,omitempty"`
-	OfflineDBLoaded bool           `json:"offline_db_loaded"`
-	OnlineFeedsUsed bool           `json:"online_feeds_used"`
+	ScannedAt         time.Time         `json:"scanned_at"`
+	DurationMS        int64             `json:"duration_ms"`
+	Ecosystem         string            `json:"ecosystem"`
+	KernelRelease     string            `json:"kernel_release,omitempty"`
+	PackageCount      int               `json:"package_count"`
+	Complete          bool              `json:"complete"`
+	Truncated         bool              `json:"truncated,omitempty"`
+	InstalledVersions map[string]string `json:"-"`
+	Findings          []Finding         `json:"findings"`
+	Drift             []DriftItem       `json:"drift"`
+	StaleProcesses    []StaleProcess    `json:"stale_processes"`
+	ImmediateCount    int               `json:"immediate_count"`
+	VirtualCount      int               `json:"virtual_count"`
+	ScheduledCount    int               `json:"scheduled_count"`
+	KEVCount          int               `json:"kev_count"`
+	FeedErrors        []string          `json:"feed_errors,omitempty"`
+	OfflineDBLoaded   bool              `json:"offline_db_loaded"`
+	OnlineFeedsUsed   bool              `json:"online_feeds_used"`
 }
 
 // OfflineAdvisory is a deterministic local vulnerability entry used for airgapped hosts and testing.
