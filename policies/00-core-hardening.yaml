@@ -116,6 +116,6 @@ rules:
     severity: critical
     action: freeze
     mitre: T1055
-    description: Detects and freezes processes invoking io_uring_setup so async IORING_OP_* operations cannot bypass syscall tracepoints on kernels older than 6.6.
+    description: Detects and freezes processes invoking io_uring_setup so async IORING_OP_* operations cannot bypass syscall tracepoints on kernels older than 6.6. Host operators running trusted io_uring workloads (e.g. databases) can add exact canonical paths under exclude_exe_paths.
     match:
       event_types: [io_uring]

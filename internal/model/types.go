@@ -95,12 +95,14 @@ type Event struct {
 	UID       uint32        `json:"uid"`
 	StartTime uint64        `json:"start_time,omitempty"`
 	DirFD     int32         `json:"dirfd,omitempty"`
-	Comm      string        `json:"comm"`
-	Exe       string        `json:"exe,omitempty"`
-	Path      string        `json:"path,omitempty"`
-	RawPath   string        `json:"raw_path,omitempty"`
-	Cmdline   string        `json:"cmdline,omitempty"`
-	Argv      []string      `json:"argv,omitempty"`
+	Comm        string        `json:"comm"`
+	Exe         string        `json:"exe,omitempty"`
+	Cwd         string        `json:"cwd,omitempty"`
+	Path        string        `json:"path,omitempty"`
+	RawPath     string        `json:"raw_path,omitempty"`
+	Cmdline     string        `json:"cmdline,omitempty"`
+	ProcCmdline string        `json:"proc_cmdline,omitempty"`
+	Argv        []string      `json:"argv,omitempty"`
 	Flags     uint32        `json:"flags,omitempty"`
 	IsWrite   bool          `json:"is_write,omitempty"`
 	DstIP     string        `json:"dst_ip,omitempty"`

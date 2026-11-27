@@ -27,7 +27,7 @@ const (
 	rawAFInet  uint16 = 2
 	rawAFInet6 uint16 = 10
 
-	openWriteMask uint32 = 0x0001 | 0x0002 | 0x0040 // O_WRONLY | O_RDWR | O_CREAT
+	openWriteMask uint32 = 0x0001 | 0x0002 | 0x0040 | 0x0200 // O_WRONLY | O_RDWR | O_CREAT | O_TRUNC
 )
 
 // RawEvent matches struct ringwall_event in ebpf/ringwall.bpf.c byte-for-byte (1344 bytes).

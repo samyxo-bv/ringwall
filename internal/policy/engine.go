@@ -271,14 +271,25 @@ func matchesRule(r *Rule, ev model.Event) bool {
 	}
 
 	if len(r.compiledCmdRegex) > 0 {
-		target := ev.Cmdline
-		if target == "" {
-			target = ev.Path
+		var targets []string
+		if ev.Cmdline != "" {
+			targets = append(targets, ev.Cmdline)
+		}
+		if ev.ProcCmdline != "" && ev.ProcCmdline != ev.Cmdline {
+			targets = append(targets, ev.ProcCmdline)
+		}
+		if len(targets) == 0 && ev.Path != "" {
+			targets = append(targets, ev.Path)
 		}
 		ok := false
 		for _, re := range r.compiledCmdRegex {
-			if re.MatchString(target) {
-				ok = true
+			for _, target := range targets {
+				if re.MatchString(target) {
+					ok = true
+					break
+				}
+			}
+			if ok {
 				break
 			}
 		}
@@ -315,25 +326,50 @@ func matchesRule(r *Rule, ev model.Event) bool {
 	return true
 }
 
-// IsDestructiveRM parses tokenized argv (plus full /proc/<pid>/cmdline when argv > 8)
-// to detect recursive rm targeting critical system roots or a user's home root,
-// even without -f, with GNU abbreviations (--rec), --, -Rf, or /bin/rm.
+// IsDestructiveRM parses tokenized argv (plus kernel Cmdline and /proc/<pid>/cmdline when argv > 8)
+// to detect recursive rm targeting critical system roots or a user's home root, including
+// GNU abbreviations (--r, --rec), --, -Rf, /bin/rm, and relative targets resolved against ev.Cwd.
 func IsDestructiveRM(ev model.Event) bool {
-	checkSlice := func(tokens []string, exe string) bool {
+	checkShellScript := func(script, cwd string) bool {
+		// Split simple shell command chains on &&, ||, ; so `cd / && rm -r usr` tracks cwd.
+		normalized := strings.NewReplacer("&&", "\n", "||", "\n", ";", "\n").Replace(script)
+		curCwd := cwd
+		for _, part := range strings.Split(normalized, "\n") {
+			fields := strings.Fields(part)
+			if len(fields) == 0 {
+				continue
+			}
+			if fields[0] == "cd" && len(fields) >= 2 {
+				dest := fields[1]
+				if strings.HasPrefix(filepath.ToSlash(dest), "/") {
+					curCwd = cleanSlash(dest)
+				} else if curCwd != "" {
+					curCwd = cleanSlash(strings.TrimRight(filepath.ToSlash(curCwd), "/") + "/" + dest)
+				}
+				continue
+			}
+			if checkRMTokens(fields, "", curCwd) {
+				return true
+			}
+		}
+		return false
+	}
+
+	checkSlice := func(tokens []string, exe, cwd string) bool {
 		if len(tokens) == 0 {
 			return false
 		}
-		if checkRMTokens(tokens, exe) {
+		if checkRMTokens(tokens, exe, cwd) {
 			return true
 		}
 		for i := 0; i < len(tokens)-1; i++ {
 			if tokens[i] == "-c" || tokens[i] == "-lc" {
 				// Quoted single-arg shell command (preserved in eBPF argv).
-				if checkRMTokens(strings.Fields(tokens[i+1]), "") {
+				if checkShellScript(tokens[i+1], cwd) {
 					return true
 				}
 				// Space-split cmdline fallback.
-				if checkRMTokens(tokens[i+1:], "") {
+				if checkShellScript(strings.Join(tokens[i+1:], " "), cwd) {
 					return true
 				}
 			}
@@ -341,18 +377,19 @@ func IsDestructiveRM(ev model.Event) bool {
 		return false
 	}
 
-	if checkSlice(ev.Argv, ev.Exe) {
+	if checkSlice(ev.Argv, ev.Exe, ev.Cwd) {
 		return true
 	}
-	if ev.Cmdline != "" {
-		if checkSlice(strings.Fields(ev.Cmdline), ev.Exe) {
-			return true
-		}
+	if ev.Cmdline != "" && checkSlice(strings.Fields(ev.Cmdline), ev.Exe, ev.Cwd) {
+		return true
+	}
+	if ev.ProcCmdline != "" && ev.ProcCmdline != ev.Cmdline && checkSlice(strings.Fields(ev.ProcCmdline), ev.Exe, ev.Cwd) {
+		return true
 	}
 	return false
 }
 
-func checkRMTokens(tokens []string, exe string) bool {
+func checkRMTokens(tokens []string, exe, cwd string) bool {
 	if len(tokens) < 2 {
 		return false
 	}
@@ -375,8 +412,8 @@ func checkRMTokens(tokens []string, exe string) bool {
 			continue
 		}
 		if !endOfOpts && strings.HasPrefix(tok, "--") {
-			// Support GNU option abbreviations (--rec, --recurs, --recursive).
-			if len(tok) >= 4 && strings.HasPrefix("--recursive", tok) {
+			// Support all GNU option abbreviations (--r, --re, --rec, --recursive).
+			if len(tok) >= 3 && strings.HasPrefix("--recursive", tok) {
 				recursive = true
 			}
 			continue
@@ -408,8 +445,17 @@ func checkRMTokens(tokens []string, exe string) bool {
 		if raw == "" {
 			continue
 		}
-		cleaned := cleanSlash(raw)
-		if exactDangerous[raw] || exactDangerous[cleaned] {
+		if exactDangerous[raw] {
+			return true
+		}
+		candidate := raw
+		if !strings.HasPrefix(filepath.ToSlash(candidate), "/") && !strings.HasPrefix(candidate, "~") && !strings.HasPrefix(candidate, "$") {
+			if cwd != "" {
+				candidate = strings.TrimRight(filepath.ToSlash(cwd), "/") + "/" + candidate
+			}
+		}
+		cleaned := cleanSlash(candidate)
+		if exactDangerous[cleaned] {
 			return true
 		}
 		for _, pref := range criticalPrefixes {

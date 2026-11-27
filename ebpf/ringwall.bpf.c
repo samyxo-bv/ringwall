@@ -1,11 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
-// Ringwall Linux eBPF tracepoint sensor.
-// Traces execve, execveat, openat, openat2, open, creat, renameat2, connect, sendto, and io_uring_setup.
-// Uses a 4 MiB ring buffer plus a per-CPU drop counter so ringbuf pressure is never silent.
+// Ringwall Linux eBPF tracing & tracepoint sensor.
+// Primary file-open path uses fentry/security_file_open + bpf_d_path (kernel-resolved VFS path,
+// immune to userspace symlink/cwd/dirfd TOCTOU, .., //, and io_uring IORING_OP_OPENAT).
+// Falls back to hardened syscall open tracepoints on kernels without fentry/BTF support, and always
+// traces execve/execveat, rename/renameat/renameat2, connect/sendto, and io_uring_setup.
 
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
+
+// Minimal CO-RE kernel VFS structs for fentry/security_file_open + bpf_d_path.
+// Placing f_flags before f_path ensures f_path has a non-zero stub offset so Clang always emits
+// a CO-RE BPF_FIELD_BYTE_OFFSET relocation rather than folding +0.
+struct vfsmount;
+struct dentry;
+struct path {
+    struct vfsmount *mnt;
+    struct dentry *dentry;
+} __attribute__((preserve_access_index));
+
+struct file {
+    unsigned int f_flags;
+    struct path f_path;
+} __attribute__((preserve_access_index));
 
 #define EVENT_EXEC     1
 #define EVENT_OPENAT   2
@@ -21,6 +38,8 @@
 #define O_WRONLY 0x0001
 #define O_RDWR   0x0002
 #define O_CREAT  0x0040
+#define O_TRUNC  0x0200
+#define WRITE_FLAGS (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC)
 
 #define PATH_MAX_LEN 256
 #define COMM_MAX_LEN 16
@@ -125,8 +144,37 @@ static __always_inline int is_sensitive_etc_read(const char *p) {
     return 0;
 }
 
+// Fast filter for kernel-resolved VFS paths returned by bpf_d_path (already canonical, no symlinks, no ..).
+static __always_inline int is_interesting_resolved_path(const char *p, __u32 flags) {
+    if (p[0] != '/') {
+        return 0; // discard pseudo-files: pipe:[...], socket:[...], anon_inode:[...]
+    }
+    if (starts_with_5(p, '/', 'h', 'o', 'm', 'e') ||
+        starts_with_5(p, '/', 'r', 'o', 'o', 't')) {
+        return 1;
+    }
+    if (starts_with_5(p, '/', 'e', 't', 'c', '/')) {
+        if (flags & WRITE_FLAGS) {
+            return 1;
+        }
+        return is_sensitive_etc_read(p);
+    }
+    if (flags & WRITE_FLAGS) {
+        if (starts_with_5(p, '/', 'v', 'a', 'r', '/') ||
+            starts_with_5(p, '/', 'u', 's', 'r', '/') ||
+            starts_with_5(p, '/', 'b', 'o', 'o', 't') ||
+            starts_with_4(p, '/', 'l', 'i', 'b') ||
+            starts_with_5(p, '/', 'r', 'u', 'n', '/')) {
+            return 1;
+        }
+    }
+    if (starts_with_5(p, '/', 'r', 'u', 'n', '/') && p[5] == 'r' && p[6] == 'i') {
+        return 1; // /run/ringwall
+    }
+    return 0;
+}
+
 static __always_inline int is_proc_bypass_path(const char *p) {
-    // Emit /proc/<self|thread-self|pid>/(root|cwd|fd) and any /proc// or /proc/./ traversal.
     if (p[6] == '/' || p[6] == '.') {
         return 1;
     }
@@ -150,6 +198,7 @@ static __always_inline int is_proc_bypass_path(const char *p) {
     return 0;
 }
 
+// Raw syscall path filter (used by rename* tracepoints and non-fentry kernel fallback).
 static __always_inline int is_interesting_path(const char *p, __u32 flags, long read_len) {
     if (p[0] == '\0') {
         return 0;
@@ -162,9 +211,16 @@ static __always_inline int is_interesting_path(const char *p, __u32 flags, long 
     if (p[0] != '/') {
         return 1;
     }
-    // Any unnormalized leading // or /./ or /../ bypass (e.g. //home/..., /./etc/shadow)
-    if (p[1] == '/' || p[1] == '.') {
-        return 1;
+    // Any unnormalized // or /. (including mid-path /usr/../home/...) passes to userspace canonicalizer.
+    #pragma clang loop unroll(disable)
+    for (int i = 0; i < PATH_MAX_LEN - 1; i++) {
+        char c = p[i];
+        if (c == '\0') {
+            break;
+        }
+        if (c == '/' && (p[i + 1] == '.' || p[i + 1] == '/')) {
+            return 1;
+        }
     }
     // User & root homes + /tmp (including directory symlinks)
     if (starts_with_5(p, '/', 'h', 'o', 'm', 'e') ||
@@ -184,9 +240,17 @@ static __always_inline int is_interesting_path(const char *p, __u32 flags, long 
             return 1;
         }
     }
+    // /run/user/..., /run/lock/..., and /run/ringwall/... (writable symlink dirs & token probes)
+    if (starts_with_5(p, '/', 'r', 'u', 'n', '/')) {
+        if ((p[5] == 'u' && p[6] == 's' && p[7] == 'e' && p[8] == 'r' && p[9] == '/') ||
+            (p[5] == 'l' && p[6] == 'o' && p[7] == 'c' && p[8] == 'k' && p[9] == '/') ||
+            (p[5] == 'r' && p[6] == 'i')) {
+            return 1;
+        }
+    }
     // /etc/ — all writes, or sensitive reads only
     if (starts_with_5(p, '/', 'e', 't', 'c', '/')) {
-        if (flags & (O_WRONLY | O_RDWR | O_CREAT)) {
+        if (flags & WRITE_FLAGS) {
             return 1;
         }
         return is_sensitive_etc_read(p);
@@ -196,7 +260,7 @@ static __always_inline int is_interesting_path(const char *p, __u32 flags, long 
         return is_proc_bypass_path(p);
     }
     // Persistence writes to /var, /usr, /boot, /lib, /run
-    if (flags & (O_WRONLY | O_RDWR | O_CREAT)) {
+    if (flags & WRITE_FLAGS) {
         if (starts_with_5(p, '/', 'v', 'a', 'r', '/') ||
             starts_with_5(p, '/', 'u', 's', 'r', '/') ||
             starts_with_5(p, '/', 'b', 'o', 'o', 't') ||
@@ -204,10 +268,6 @@ static __always_inline int is_interesting_path(const char *p, __u32 flags, long 
             starts_with_5(p, '/', 'r', 'u', 'n', '/')) {
             return 1;
         }
-    }
-    // Reads of /run/ringwall (e.g. token theft probes)
-    if (starts_with_5(p, '/', 'r', 'u', 'n', '/') && p[5] == 'r' && p[6] == 'i') {
-        return 1;
     }
     return 0;
 }
@@ -335,6 +395,42 @@ static __always_inline int emit_sockaddr(__u32 ev_type, const void *user_addr, l
     return 0;
 }
 
+// Primary kernel-resolved file open hook (Linux 5.10+ with BTF, no lsm= boot param required).
+// Resolves symlinks, .., //, cwd, dirfd, and io_uring IORING_OP_OPENAT in-kernel before open returns.
+SEC("fentry/security_file_open")
+int trace_security_file_open(__u64 *ctx) {
+    struct file *file = (struct file *)ctx[0];
+    __u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+    if (is_self_pid(pid) || !file) {
+        return 0;
+    }
+
+    struct ringwall_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e) {
+        record_drop();
+        return 0;
+    }
+
+    init_event(e);
+    __u32 flags = file->f_flags;
+    e->flags = flags;
+    e->dirfd = AT_FDCWD;
+
+    long n = bpf_d_path(__builtin_preserve_access_index(&file->f_path), e->path, sizeof(e->path));
+    if (n <= 1 || !is_interesting_resolved_path(e->path, flags)) {
+        bpf_ringbuf_discard(e, 0);
+        return 0;
+    }
+
+    e->type = EVENT_OPENAT;
+    e->pid = pid;
+    e->uid = (__u32)bpf_get_current_uid_gid();
+    bpf_get_current_comm(&e->comm, sizeof(e->comm));
+
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
 SEC("tracepoint/syscalls/sys_enter_execve")
 int trace_execve(struct sys_enter_ctx *ctx) {
     return emit_exec(AT_FDCWD, (const void *)ctx->args[0], (const void *)ctx->args[1]);
@@ -368,6 +464,18 @@ int trace_open(struct sys_enter_ctx *ctx) {
 SEC("tracepoint/syscalls/sys_enter_creat")
 int trace_creat(struct sys_enter_ctx *ctx) {
     return emit_open(AT_FDCWD, (const void *)ctx->args[0], O_WRONLY | O_CREAT);
+}
+
+SEC("tracepoint/syscalls/sys_enter_rename")
+int trace_rename(struct sys_enter_ctx *ctx) {
+    // x86_64 rename(oldpath=args[0], newpath=args[1]) used by glibc/Python os.rename.
+    return emit_open(AT_FDCWD, (const void *)ctx->args[1], O_WRONLY | O_CREAT);
+}
+
+SEC("tracepoint/syscalls/sys_enter_renameat")
+int trace_renameat(struct sys_enter_ctx *ctx) {
+    // renameat(olddfd=args[0], oldpath=args[1], newdfd=args[2], newpath=args[3])
+    return emit_open((__s32)ctx->args[2], (const void *)ctx->args[3], O_WRONLY | O_CREAT);
 }
 
 SEC("tracepoint/syscalls/sys_enter_renameat2")

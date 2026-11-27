@@ -354,12 +354,20 @@ func (t *Tracker) Enrich(ev *model.Event) {
 		if ev.Comm == "" {
 			ev.Comm = live.Comm
 		}
+		if ev.Cwd == "" && cwd != "" {
+			ev.Cwd = cwd
+		}
 		if ev.Exe == "" {
 			ev.Exe = live.Exe
 		}
-		// Prefer fuller /proc/<pid>/cmdline when eBPF argv was truncated (e.g. > 8 args).
-		if live.Cmdline != "" && (ev.Cmdline == "" || len(live.Cmdline) > len(ev.Cmdline)) {
-			ev.Cmdline = live.Cmdline
+		// Keep kernel-captured eBPF Cmdline intact to avoid /proc/cmdline TOCTOU/overwrite,
+		// while retaining fuller /proc/<pid>/cmdline (e.g. > 8 args) separately in ProcCmdline.
+		if live.Cmdline != "" {
+			if ev.Cmdline == "" {
+				ev.Cmdline = live.Cmdline
+			} else if live.Cmdline != ev.Cmdline {
+				ev.ProcCmdline = live.Cmdline
+			}
 		}
 		if ev.UID == 0 && live.UID != 0 {
 			ev.UID = live.UID

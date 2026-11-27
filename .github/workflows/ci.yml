@@ -65,12 +65,13 @@ jobs:
             listen_addr: 127.0.0.1:19443
             token_file: ${TMPDIR}/run/api.token
           EOF
-          sudo ./bin/ringwalld -config "${TMPDIR}/ringwall.yaml" &
+          sudo ./bin/ringwalld -config "${TMPDIR}/ringwall.yaml" 2>"${TMPDIR}/daemon.log" &
           DPID=$!
-          trap "sudo kill $DPID 2>/dev/null || true" EXIT
+          trap "cat ${TMPDIR}/daemon.log || true; sudo kill $DPID 2>/dev/null || true" EXIT
           for i in $(seq 1 20); do sudo test -f "${TMPDIR}/run/api.token" && break; sleep 0.5; done
           PERM="$(sudo stat -c '%a' "${TMPDIR}/run/api.token")"
           test "${PERM}" = "600"
+          grep -q "attached fentry/security_file_open" "${TMPDIR}/daemon.log"
           sudo ./bin/ringwallctl -api http://127.0.0.1:19443 -token-file "${TMPDIR}/run/api.token" status
           sudo ./bin/ringwallctl -api http://127.0.0.1:19443 -token-file "${TMPDIR}/run/api.token" simulate
           sudo ./bin/ringwallctl verify-log "${TMPDIR}/log/audit.jsonl"
@@ -117,7 +118,7 @@ jobs:
       - name: Build hardened immutable bootable ISO
         run: sudo ./iso/build-iso.sh --out dist/ringwall-appliance-amd64.iso
 
-      - name: Boot ISO in QEMU & verify 10 live security assertions
+      - name: Boot ISO in QEMU & verify 12 live security assertions
         run: ./iso/test-qemu.sh dist/ringwall-appliance-amd64.iso
 
       - name: Upload verified bootable ISO

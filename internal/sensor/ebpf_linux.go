@@ -49,6 +49,12 @@ func newEBPFSensor(cfg config.SensorConfig) (Sensor, error) {
 	}
 
 	coll, err := ebpf.NewCollection(spec)
+	if err != nil && spec.Programs["trace_security_file_open"] != nil {
+		// Graceful fallback for older or non-BTF kernels without fentry trampoline support.
+		log.Printf("ringwall: fentry/security_file_open unavailable (%v); falling back to syscall open tracepoints", err)
+		delete(spec.Programs, "trace_security_file_open")
+		coll, err = ebpf.NewCollection(spec)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("load bpf collection: %w", err)
 	}
@@ -69,6 +75,21 @@ func newEBPFSensor(cfg config.SensorConfig) (Sensor, error) {
 		}
 	}
 
+	links := make([]link.Link, 0, 14)
+
+	// Attach primary kernel-resolved fentry/security_file_open (bpf_d_path) when available.
+	fentryOpenActive := false
+	if prog := coll.Programs["trace_security_file_open"]; prog != nil {
+		l, attachErr := link.AttachTracing(link.TracingOptions{Program: prog})
+		if attachErr != nil {
+			log.Printf("ringwall: fentry/security_file_open attach failed (%v); falling back to syscall open tracepoints", attachErr)
+		} else {
+			links = append(links, l)
+			fentryOpenActive = true
+			log.Printf("ringwall: attached fentry/security_file_open (kernel bpf_d_path canonicalization active)")
+		}
+	}
+
 	type tpSpec struct {
 		prog     string
 		group    string
@@ -78,17 +99,22 @@ func newEBPFSensor(cfg config.SensorConfig) (Sensor, error) {
 	specs := []tpSpec{
 		{prog: "trace_execve", group: "syscalls", name: "sys_enter_execve"},
 		{prog: "trace_execveat", group: "syscalls", name: "sys_enter_execveat", optional: true},
-		{prog: "trace_openat", group: "syscalls", name: "sys_enter_openat"},
-		{prog: "trace_openat2", group: "syscalls", name: "sys_enter_openat2", optional: true},
-		{prog: "trace_open", group: "syscalls", name: "sys_enter_open", optional: true},
-		{prog: "trace_creat", group: "syscalls", name: "sys_enter_creat", optional: true},
+		{prog: "trace_rename", group: "syscalls", name: "sys_enter_rename", optional: true},
+		{prog: "trace_renameat", group: "syscalls", name: "sys_enter_renameat", optional: true},
 		{prog: "trace_renameat2", group: "syscalls", name: "sys_enter_renameat2", optional: true},
 		{prog: "trace_connect", group: "syscalls", name: "sys_enter_connect"},
 		{prog: "trace_sendto", group: "syscalls", name: "sys_enter_sendto", optional: true},
 		{prog: "trace_io_uring_setup", group: "syscalls", name: "sys_enter_io_uring_setup", optional: true},
 	}
+	if !fentryOpenActive {
+		specs = append(specs,
+			tpSpec{prog: "trace_openat", group: "syscalls", name: "sys_enter_openat"},
+			tpSpec{prog: "trace_openat2", group: "syscalls", name: "sys_enter_openat2", optional: true},
+			tpSpec{prog: "trace_open", group: "syscalls", name: "sys_enter_open", optional: true},
+			tpSpec{prog: "trace_creat", group: "syscalls", name: "sys_enter_creat", optional: true},
+		)
+	}
 
-	links := make([]link.Link, 0, len(specs))
 	for _, s := range specs {
 		prog := coll.Programs[s.prog]
 		if prog == nil {

