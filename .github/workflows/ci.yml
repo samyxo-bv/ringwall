@@ -290,10 +290,10 @@ jobs:
             for i in $(seq 1 20); do sudo test -f "${TMPDIR}/run/api-optin.token" && break; sleep 0.5; done
             grep -q "allowed_ssh=1" "${TMPDIR}/daemon-optin.log"
 
-            # Positive control (P2-g): untraced opt-in ssh-keygen opens decoy key (reaches key parser -> invalid format, NOT EPERM):
+            # Positive control (P2-g): untraced opt-in ssh-keygen opens decoy key (reaches key parser -> invalid format / error in libcrypto, NOT EPERM):
             POS_OUT="$(timeout 10 /usr/bin/ssh-keygen -y -f "${TMPDIR}/ldp/.ssh/id_ed25519" </dev/null 2>&1 || true)"
             echo "POSITIVE_CONTROL: ${POS_OUT}"
-            echo "${POS_OUT}" | grep -qi "invalid format"
+            echo "${POS_OUT}" | grep -qiE "(invalid format|error in libcrypto)"
             ! echo "${POS_OUT}" | grep -qi "Operation not permitted"
 
             # Live P1-A proof on opt-in ssh-keygen: LD_PRELOAD blocked at ld.so map time (main/pthread/fork never run):
