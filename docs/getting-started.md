@@ -1,4 +1,4 @@
-# Getting Started with Ringwall
+# Getting Started with Ringwall by Samyxo
 
 This guide walks you through installing Ringwall on a Linux host or booting the verified immutable ISO, enabling synchronous eBPF LSM kernel blocking, configuring an uncensored/local AI Guardian, and verifying protection end-to-end.
 

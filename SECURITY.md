@@ -1,4 +1,4 @@
-# Security Policy & Threat Model
+# Ringwall by Samyxo — Security Policy & Threat Model
 
 ## Honest Threat Model
 

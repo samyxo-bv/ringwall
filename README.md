@@ -1,5 +1,7 @@
 # Ringwall
 
+**by [Samyxo](https://www.samyxo.nl/)**
+
 [![CI](https://github.com/samyxo-bv/ringwall/actions/workflows/ci.yml/badge.svg)](https://github.com/samyxo-bv/ringwall/actions/workflows/ci.yml)
 [![Security Scan](https://github.com/samyxo-bv/ringwall/actions/workflows/security-scan.yml/badge.svg)](https://github.com/samyxo-bv/ringwall/actions/workflows/security-scan.yml)
 [![Release](https://img.shields.io/github/v/release/samyxo-bv/ringwall)](https://github.com/samyxo-bv/ringwall/releases/latest)
@@ -138,4 +140,4 @@ Every CI run verifies **zero-exemption default blocking** (`ssh -F` and rogue `S
 ## Security Policy & License
 
 - Read [SECURITY.md](SECURITY.md) for our honest threat model, explicit limitations, and private vulnerability reporting process.
-- Apache License 2.0 — see [LICENSE](LICENSE). Built and open-sourced by [Samyxo B.V.](https://github.com/samyxo-bv).
+- Apache License 2.0 — see [LICENSE](LICENSE). Built and open-sourced by [Samyxo B.V.](https://www.samyxo.nl/) ([github.com/samyxo-bv](https://github.com/samyxo-bv)).

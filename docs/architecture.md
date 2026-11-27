@@ -1,4 +1,4 @@
-# Ringwall Architecture
+# Ringwall by Samyxo — Architecture
 
 Ringwall is designed around a single security rule: **deterministic kernel enforcement executes synchronously first; userspace policies, self-healing, and AI triage sit strictly above it and can never weaken it.**
 
