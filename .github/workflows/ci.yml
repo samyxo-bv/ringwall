@@ -13,6 +13,7 @@ jobs:
   build-and-test:
     name: eBPF + Go Build & Race Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -50,6 +51,33 @@ jobs:
           TMPDIR="$(mktemp -d)"
           chmod 0755 "${TMPDIR}"
           sudo mkdir -p "${TMPDIR}/run" "${TMPDIR}/log"
+
+          # Pre-create test fixtures BEFORE starting ringwalld so the step shell itself never opens a /.ssh/id_* path while LSM is active.
+          mkdir -p "${TMPDIR}/ldp/.ssh"
+          printf 'RINGWALL-LDP-DECOY\n' > "${TMPDIR}/ldp/.ssh/id_ed25519"
+          cat > "${TMPDIR}/ldp/evil.c" <<'CEOF'
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <unistd.h>
+          __attribute__((constructor)) static void steal(void) {
+              const char *p = getenv("RW_TARGET_KEY");
+              if (!p) _exit(90);
+              int fd = open(p, O_RDONLY);
+              if (fd < 0) {
+                  dprintf(2, "LDP_ERRNO=%d\n", errno);
+                  _exit(42);
+              }
+              close(fd);
+              dprintf(2, "LDP_LEAKED=1\n");
+              _exit(43);
+          }
+          CEOF
+          clang -shared -fPIC -O2 "${TMPDIR}/ldp/evil.c" -o "${TMPDIR}/ldp/evil.so"
+          cp /bin/true "${TMPDIR}/vp-target-bin"
+          chmod 0755 "${TMPDIR}/vp-target-bin"
+
           cat > "${TMPDIR}/ringwall.yaml" <<EOF
           mode: interactive
           policy_dirs:
@@ -75,7 +103,7 @@ jobs:
           EOF
           sudo ./bin/ringwalld -config "${TMPDIR}/ringwall.yaml" 2>"${TMPDIR}/daemon.log" &
           DPID=$!
-          trap "cat ${TMPDIR}/daemon.log || true; sudo kill $DPID 2>/dev/null || true; rm -rf ${TMPDIR}" EXIT
+          trap "cat ${TMPDIR}/daemon.log || true; sudo kill $DPID 2>/dev/null || true; sleep 0.5; sudo rm -rf ${TMPDIR}" EXIT
           for i in $(seq 1 20); do sudo test -f "${TMPDIR}/run/api.token" && break; sleep 0.5; done
           PERM="$(sudo stat -c '%a' "${TMPDIR}/run/api.token")"
           test "${PERM}" = "600"
@@ -94,46 +122,36 @@ jobs:
             grep -q "attached lsm/mmap_file" "${TMPDIR}/daemon.log"
             grep -q "attached lsm/ptrace_access_check" "${TMPDIR}/daemon.log"
             grep -q "attached lsm/bprm_check_security" "${TMPDIR}/daemon.log"
-            mkdir -p "${TMPDIR}/ldp/.ssh"
-            printf 'RINGWALL-LDP-DECOY\n' > "${TMPDIR}/ldp/.ssh/id_ed25519"
-            cat > "${TMPDIR}/ldp/evil.c" <<'CEOF'
-          #include <errno.h>
-          #include <fcntl.h>
-          #include <stdio.h>
-          #include <stdlib.h>
-          #include <unistd.h>
-          __attribute__((constructor)) static void steal(void) {
-              const char *p = getenv("RW_TARGET_KEY");
-              if (!p) _exit(90);
-              int fd = open(p, O_RDONLY);
-              if (fd < 0) {
-                  dprintf(2, "LDP_ERRNO=%d\n", errno);
-                  _exit(42);
-              }
-              close(fd);
-              dprintf(2, "LDP_LEAKED=1\n");
-              _exit(43);
-          }
-          CEOF
-            clang -shared -fPIC -O2 "${TMPDIR}/ldp/evil.c" -o "${TMPDIR}/ldp/evil.so"
-            LDP_OUT="$(RW_TARGET_KEY="${TMPDIR}/ldp/.ssh/id_ed25519" LD_PRELOAD="${TMPDIR}/ldp/evil.so" /usr/bin/ssh-keygen -l -f /dev/null 2>&1 || true)"
-            echo "${LDP_OUT}"
-            echo "${LDP_OUT}" | grep -q "LDP_ERRNO=1"
-            ! echo "${LDP_OUT}" | grep -q "LDP_LEAKED=1"
+            RW_TARGET_KEY="${TMPDIR}/ldp/.ssh/id_ed25519" LD_PRELOAD="${TMPDIR}/ldp/evil.so" /usr/bin/ssh-keygen -l -f /dev/null >"${TMPDIR}/ldp_out" 2>&1 &
+            TPID=$!
+            for _ in $(seq 1 12); do
+              [ -s "${TMPDIR}/ldp_out" ] && break
+              grep -q '(stopped)' /proc/$TPID/status 2>/dev/null && kill -CONT $TPID 2>/dev/null || true
+              sleep 0.25
+            done
+            kill -9 $TPID 2>/dev/null || true
+            wait $TPID 2>/dev/null || true
+            cat "${TMPDIR}/ldp_out"
+            grep -q "LDP_ERRNO=1" "${TMPDIR}/ldp_out"
+            ! grep -q "LDP_LEAKED=1" "${TMPDIR}/ldp_out"
 
             # Live lsm/bprm_check_security proof: virtual-patched binary blocked pre-exec -> unblocked on DELETE!
             TOKEN="$(sudo cat "${TMPDIR}/run/api.token")"
-            cp /bin/true "${TMPDIR}/vp-target-bin"
-            chmod 0755 "${TMPDIR}/vp-target-bin"
             "${TMPDIR}/vp-target-bin"
             curl -fsS -X POST -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json" \
               -d "{\"id\":\"VP-LIVE-TEST\",\"cve\":\"CVE-2099-9999\",\"package\":\"vp-test\",\"target_exe_paths\":[\"${TMPDIR}/vp-target-bin\"],\"action\":\"freeze\",\"source\":\"operator\",\"rationale\":\"live CI LSM bprm verification\"}" \
               http://127.0.0.1:19443/api/v1/virtual-patches
-            if "${TMPDIR}/vp-target-bin" 2>"${TMPDIR}/vp_err"; then
-              echo "FAIL: virtual-patched binary was NOT blocked by lsm/bprm_check_security!" >&2
-              exit 1
-            fi
-            cat "${TMPDIR}/vp_err"
+            python3 -c 'import os, sys; exec("try:\n os.execv(sys.argv[1], [sys.argv[1]])\nexcept OSError as e:\n print(\"VP_EXEC_ERRNO=\" + str(e.errno), flush=True)")' "${TMPDIR}/vp-target-bin" >"${TMPDIR}/vp_out" 2>&1 &
+            VPID=$!
+            for _ in $(seq 1 12); do
+              [ -s "${TMPDIR}/vp_out" ] && break
+              grep -q '(stopped)' /proc/$VPID/status 2>/dev/null && kill -CONT $VPID 2>/dev/null || true
+              sleep 0.25
+            done
+            kill -9 $VPID 2>/dev/null || true
+            wait $VPID 2>/dev/null || true
+            cat "${TMPDIR}/vp_out"
+            grep -q "VP_EXEC_ERRNO=1" "${TMPDIR}/vp_out"
             curl -fsS -X DELETE -H "Authorization: Bearer ${TOKEN}" \
               http://127.0.0.1:19443/api/v1/virtual-patches/VP-LIVE-TEST
             "${TMPDIR}/vp-target-bin"
@@ -152,6 +170,7 @@ jobs:
   build-and-verify-iso:
     name: Build Immutable ISO & Live QEMU Attack E2E
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: build-and-test
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
