@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ringwall by Samyxo — Fail-Closed Linux eBPF LSM Guardian &amp; Immutable ISO</title>
+  <meta name="description" content="Fail-closed Linux eBPF LSM runtime guardian, CVE/KEV self-healing patcher, uncensored AI Guardian, and live QEMU-verified immutable Linux appliance ISO. Apache-2.0 open source by Samyxo B.V." />
+  <style>
+    :root {
+      --bg: #0b0f17;
+      --panel: #121826;
+      --panel-2: #171f30;
+      --border: #243047;
+      --text: #e6edf7;
+      --muted: #93a4bf;
+      --accent: #38bdf8;
+      --accent-2: #34d399;
+      --warn: #fbbf24;
+      --code-bg: #080c13;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+      background: radial-gradient(1200px 600px at 50% -10%, #16243d 0%, var(--bg) 60%);
+      color: var(--text);
+      line-height: 1.6;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .wrap { max-width: 1020px; margin: 0 auto; padding: 0 22px; }
+    header {
+      border-bottom: 1px solid var(--border);
+      padding: 18px 0;
+      background: rgba(11, 15, 23, 0.85);
+      position: sticky;
+      top: 0;
+      backdrop-filter: blur(8px);
+      z-index: 10;
+    }
+    .nav { display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; }
+    .brand { font-weight: 800; font-size: 1.15rem; letter-spacing: 0.02em; color: var(--text); }
+    .brand span { color: var(--accent); font-weight: 600; font-size: 0.9rem; margin-left: 6px; }
+    .nav-links { display: flex; gap: 18px; font-size: 0.92rem; flex-wrap: wrap; }
+    .nav-links a { color: var(--muted); }
+    .nav-links a:hover { color: var(--text); text-decoration: none; }
+    .hero { padding: 64px 0 42px; }
+    .pill {
+      display: inline-block;
+      padding: 4px 12px;
+      border-radius: 999px;
+      background: rgba(56, 189, 248, 0.12);
+      border: 1px solid rgba(56, 189, 248, 0.35);
+      color: var(--accent);
+      font-size: 0.82rem;
+      font-weight: 600;
+      margin-bottom: 16px;
+    }
+    h1 { font-size: clamp(2.1rem, 4.4vw, 3.2rem); line-height: 1.12; margin: 0 0 18px; letter-spacing: -0.02em; }
+    .lead { font-size: 1.12rem; color: var(--muted); max-width: 780px; margin: 0 0 26px; }
+    .cta-row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 28px; }
+    .btn {
+      display: inline-block;
+      padding: 11px 18px;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 0.95rem;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--text);
+    }
+    .btn.primary { background: var(--accent); color: #06101b; border-color: var(--accent); }
+    .btn.primary:hover { background: #7dd3fc; text-decoration: none; }
+    .btn:hover { border-color: var(--accent); text-decoration: none; }
+    .honesty {
+      background: rgba(251, 191, 36, 0.08);
+      border: 1px solid rgba(251, 191, 36, 0.32);
+      border-radius: 10px;
+      padding: 16px 18px;
+      font-size: 0.95rem;
+      color: #f3e4bd;
+    }
+    .honesty strong { color: var(--warn); }
+    section { padding: 34px 0; border-top: 1px solid var(--border); }
+    h2 { font-size: 1.45rem; margin: 0 0 16px; letter-spacing: -0.01em; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 18px;
+    }
+    .card h3 { margin: 0 0 8px; font-size: 1.05rem; color: var(--text); }
+    .card p { margin: 0; color: var(--muted); font-size: 0.92rem; }
+    .badge-ok { color: var(--accent-2); font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; display: block; }
+    pre {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+      overflow-x: auto;
+      font-size: 0.86rem;
+      line-height: 1.5;
+      color: #dbeafe;
+      margin: 12px 0 0;
+    }
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr)); gap: 12px; margin-top: 16px; }
+    .stat { background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+    .stat .num { font-size: 1.5rem; font-weight: 800; color: var(--accent-2); }
+    .stat .lbl { font-size: 0.82rem; color: var(--muted); }
+    .docs-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+    .doc-link {
+      display: block;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px;
+      color: var(--text);
+    }
+    .doc-link:hover { border-color: var(--accent); text-decoration: none; }
+    .doc-link small { display: block; color: var(--muted); margin-top: 4px; font-size: 0.84rem; }
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 28px 0 44px;
+      color: var(--muted);
+      font-size: 0.88rem;
+      display: flex;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap nav">
+      <div class="brand">Ringwall <span>by Samyxo</span></div>
+      <nav class="nav-links">
+        <a href="#features">Architecture</a>
+        <a href="#quickstart">Quick Start</a>
+        <a href="#verification">Verification</a>
+        <a href="#docs">Docs</a>
+        <a href="https://github.com/samyxo-bv/ringwall/releases/tag/v0.2.0">v0.2.0 Release</a>
+        <a href="https://github.com/samyxo-bv/ringwall">GitHub</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <div class="hero">
+      <div class="pill">Apache-2.0 Open Source &bull; v0.2.0 Live &bull; Go + C eBPF LSM</div>
+      <h1>Fail-closed Linux kernel enforcement for the AI-agent era.</h1>
+      <p class="lead">
+        <strong>Ringwall by Samyxo</strong> is a deterministic Linux eBPF LSM runtime guardian, automated CVE/KEV &amp; drift self-healer, optional uncensored local AI Guardian, and a live QEMU-verified bootable immutable ISO.
+      </p>
+      <div class="cta-row">
+        <a class="btn primary" href="https://github.com/samyxo-bv/ringwall/releases/tag/v0.2.0">Download v0.2.0 (Binaries &amp; 194 MB ISO)</a>
+        <a class="btn" href="https://github.com/samyxo-bv/ringwall">View Source on GitHub</a>
+        <a class="btn" href="https://github.com/samyxo-bv/ringwall/blob/main/docs/getting-started.md">Getting Started</a>
+      </div>
+      <div class="honesty">
+        <strong>Security honesty upfront:</strong> No OS has &ldquo;zero vulnerabilities&rdquo;, and an LLM must never be your primary security boundary or live-patch unknown 0-day source code in production. Ringwall enforces deterministically inside the Linux kernel first (<code>-EPERM</code> before 1 byte is read or executed) and restricts AI to explanation, escalation, and strictly validated declarative containment rules.
+      </div>
+      <div class="stats">
+        <div class="stat"><div class="num">4 LSM Hooks</div><div class="lbl">file_open, mmap_file, ptrace_access_check, bprm_check_security</div></div>
+        <div class="stat"><div class="num">16 Live Proofs</div><div class="lbl">Booted headless in QEMU on every CI &amp; release run</div></div>
+        <div class="stat"><div class="num">0 CVEs</div><div class="lbl">Verified daily via pinned govulncheck@v1.10.0 on Go 1.27</div></div>
+        <div class="stat"><div class="num">0 Exemptions</div><div class="lbl">Default SSH private-key policy blocks ssh -F &amp; rogue ssh-add</div></div>
+      </div>
+    </div>
+
+    <section id="features">
+      <h2>Three-Pillar Architecture</h2>
+      <div class="grid">
+        <div class="card">
+          <span class="badge-ok">Tier 1 &bull; Synchronous Kernel Wall</span>
+          <h3>Fail-Closed eBPF LSM</h3>
+          <p><code>lsm/file_open</code> resolves paths via <code>bpf_d_path</code> into per-CPU scratch memory <strong>before</strong> reserving ringbuf space &mdash; returning <code>-EPERM</code> before a single byte is read, even under a deliberate ringbuf saturation flood. Automatic fallback to <code>fentry</code>, syscall tracepoints, and <code>procfs</code>.</p>
+        </div>
+        <div class="card">
+          <span class="badge-ok">Pillar 2 &bull; Continuous Remediation</span>
+          <h3>CVE/KEV Scanner &amp; Self-Healer</h3>
+          <p>Pure-Go <code>dpkg</code>/<code>apk</code> inventory, deleted <code>.so</code> detection in <code>/proc/*/maps</code>, and baseline sysctl/<code>0600</code> drift checks against opt-in OSV.dev + CISA KEV or airgapped JSON bundles. Security-only <code>apt-get</code> upgrades with zero shell execution.</p>
+        </div>
+        <div class="card">
+          <span class="badge-ok">Pillar 3 &bull; 0-Day Containment</span>
+          <h3>TTL-Bounded Virtual Patcher</h3>
+          <p>Synthesizes temporary declarative containment rules + <code>lsm/bprm_check_security</code> blocking for unpatched 0-days under live <code>(dev, ino)</code> anti-lockout indices, runtime <code>vpExeGuard</code>, <code>O_PATH|O_NOFOLLOW</code>, and ext4/xfs/btrfs <code>i_generation</code> checks.</p>
+        </div>
+        <div class="card">
+          <span class="badge-ok">Layer 2 &bull; Refusal-Resistant Triage</span>
+          <h3>Uncensored Local AI Guardian</h3>
+          <p>Supports Ollama, llama.cpp, Venice.ai, and OpenRouter with a guided 4-point refusal test wizard so real threat telemetry never triggers safety refusals. Hard invariant: AI can explain or escalate, never downgrade verdicts.</p>
+        </div>
+        <div class="card">
+          <span class="badge-ok">Immutable Appliance</span>
+          <h3>Read-Only SquashFS ISO</h3>
+          <p>Hybrid BIOS + UEFI Debian Bookworm ISO booted with <code>lsm=lockdown,yama,integrity,apparmor,bpf</code>, <code>lockdown=integrity</code>, default-deny <code>nftables</code>, locked accounts, no <code>sshd</code>, and Ed25519 A/B manifest verification tooling.</p>
+        </div>
+        <div class="card">
+          <span class="badge-ok">Tamper-Evident Control Plane</span>
+          <h3>Root-Only API &amp; Hash-Chained Audit</h3>
+          <p>Loopback-only admin API (<code>127.0.0.1:9443</code>) with <code>0600 root</code> bearer token, self-contained Web UI (zero external CDNs), and SHA-256 hash-chained <code>audit.jsonl</code> verified via <code>ringwallctl verify-log</code>.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="quickstart">
+      <h2>Quick Start (Any Linux Host)</h2>
+      <pre>VERSION=v0.2.0
+BASE="https://github.com/samyxo-bv/ringwall/releases/download/${VERSION}"
+curl -fsSLO "${BASE}/ringwall-${VERSION}-linux-amd64.tar.gz"
+curl -fsSLO "${BASE}/SHA256SUMS.txt"
+grep "linux-amd64.tar.gz" SHA256SUMS.txt | sha256sum -c -
+
+mkdir -p ringwall-install &amp;&amp; tar -xzf "ringwall-${VERSION}-linux-amd64.tar.gz" -C ringwall-install
+cd ringwall-install &amp;&amp; sudo ./packaging/install.sh
+
+sudo ringwallctl setup        # Guided AI + mode wizard with live 4-point refusal test
+sudo ringwallctl scan         # Live CVE/KEV, stale-library &amp; kernel drift scan
+sudo ringwallctl simulate     # 5 safe built-in attack scenarios
+sudo ringwallctl verify-log   # Verify SHA-256 audit hash chain</pre>
+    </section>
+
+    <section id="verification">
+      <h2>Live Attack Verification (Not Just Unit Tests)</h2>
+      <p style="color: var(--muted); margin-top: 0;">
+        Every commit and release passes Go <code>-race</code> tests across all 12 packages, live Ubuntu host LSM proofs (<code>ssh -F</code> &amp; rogue <code>SSH_AUTH_SOCK</code> <code>ssh-add</code> blocked with <code>-EPERM</code>, <code>ext4</code> <code>FS_IOC_GETVERSION</code> + <code>bprm</code> block/revoke, opt-in <code>ssh-keygen</code> positive control, <code>LD_PRELOAD</code> main/pthread/fork blocked at <code>ld.so</code> map time, pre-exec <code>PTRACE_TRACEME</code> blocked), AND 16 live attack assertions inside the booted QEMU ISO (hardlinks, <code>/usr/../home</code>, <code>//home</code>, <code>/tmp/ssh</code> spoof, symlinks, <code>io_uring</code>, <code>userns</code>, and UDP ringbuf saturation flood).
+      </p>
+    </section>
+
+    <section id="docs">
+      <h2>Documentation</h2>
+      <div class="docs-list">
+        <a class="doc-link" href="https://github.com/samyxo-bv/ringwall/blob/main/docs/getting-started.md"><strong>Getting Started</strong><small>Tarball, source, ISO, GRUB BPF LSM, SSH opt-in</small></a>
+        <a class="doc-link" href="https://github.com/samyxo-bv/ringwall/blob/main/docs/architecture.md"><strong>Architecture</strong><small>3-tier eBPF hooks, pidfd/cgroup, privilege model</small></a>
+        <a class="doc-link" href="https://github.com/samyxo-bv/ringwall/blob/main/docs/configuration-and-policies.md"><strong>Config &amp; Policies</strong><small>ringwall.yaml, 13 built-in rules, 11 drift checks</small></a>
+        <a class="doc-link" href="https://github.com/samyxo-bv/ringwall/blob/main/docs/self-healing-and-ab-updates.md"><strong>Self-Healing &amp; A/B</strong><small>Scanner, auto-patcher, anti-lockout, Ed25519 A/B</small></a>
+        <a class="doc-link" href="https://github.com/samyxo-bv/ringwall/blob/main/docs/cli-and-api.md"><strong>CLI &amp; HTTP API</strong><small>All ringwallctl commands &amp; 15 REST/SSE endpoints</small></a>
+        <a class="doc-link" href="https://github.com/samyxo-bv/ringwall/blob/main/docs/immutable-iso.md"><strong>Immutable ISO</strong><small>Build, --with-model, QEMU boot, 16 live assertions</small></a>
+        <a class="doc-link" href="https://github.com/samyxo-bv/ringwall/blob/main/SECURITY.md"><strong>Security &amp; Threat Model</strong><small>Honest boundaries, invariants &amp; responsible disclosure</small></a>
+        <a class="doc-link" href="https://github.com/samyxo-bv/ringwall/discussions"><strong>GitHub Discussions</strong><small>Questions, bypass ideas, threat-model critique</small></a>
+      </div>
+    </section>
+  </main>
+
+  <footer class="wrap">
+    <div>Built and open-sourced under Apache-2.0 by <a href="https://www.samyxo.nl/">Samyxo B.V.</a></div>
+    <div><a href="https://github.com/samyxo-bv/ringwall">github.com/samyxo-bv/ringwall</a> &bull; <a href="https://github.com/samyxo-bv/ringwall/releases/tag/v0.2.0">Release v0.2.0</a></div>
+  </footer>
+</body>
+</html>
