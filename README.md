@@ -1,6 +1,6 @@
 # Ringwall
 
-**by [Samyxo](https://www.samyxo.nl/)**
+**by [Samyxo](https://www.samyxo.nl/)** &bull; [Project Website](https://samyxo-bv.github.io/ringwall/) &bull; [v0.2.0 Release](https://github.com/samyxo-bv/ringwall/releases/tag/v0.2.0) &bull; [Discussions](https://github.com/samyxo-bv/ringwall/discussions)
 
 [![CI](https://github.com/samyxo-bv/ringwall/actions/workflows/ci.yml/badge.svg)](https://github.com/samyxo-bv/ringwall/actions/workflows/ci.yml)
 [![Security Scan](https://github.com/samyxo-bv/ringwall/actions/workflows/security-scan.yml/badge.svg)](https://github.com/samyxo-bv/ringwall/actions/workflows/security-scan.yml)
