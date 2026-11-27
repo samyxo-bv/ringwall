@@ -27,6 +27,7 @@ type ebpfSensor struct {
 	links     []link.Link
 	reader    *ringbuf.Reader
 	statsMap  *ebpf.Map
+	openHook  string
 	chanDrops atomic.Uint64
 }
 
@@ -102,11 +103,17 @@ func newEBPFSensor(cfg config.SensorConfig) (Sensor, error) {
 		{prog: "trace_rename", group: "syscalls", name: "sys_enter_rename", optional: true},
 		{prog: "trace_renameat", group: "syscalls", name: "sys_enter_renameat", optional: true},
 		{prog: "trace_renameat2", group: "syscalls", name: "sys_enter_renameat2", optional: true},
+		{prog: "trace_link", group: "syscalls", name: "sys_enter_link", optional: true},
+		{prog: "trace_linkat", group: "syscalls", name: "sys_enter_linkat", optional: true},
+		{prog: "trace_symlink", group: "syscalls", name: "sys_enter_symlink", optional: true},
+		{prog: "trace_symlinkat", group: "syscalls", name: "sys_enter_symlinkat", optional: true},
 		{prog: "trace_connect", group: "syscalls", name: "sys_enter_connect"},
 		{prog: "trace_sendto", group: "syscalls", name: "sys_enter_sendto", optional: true},
 		{prog: "trace_io_uring_setup", group: "syscalls", name: "sys_enter_io_uring_setup", optional: true},
 	}
+	openHook := "fentry/security_file_open"
 	if !fentryOpenActive {
+		openHook = "tracepoint/sys_enter_openat"
 		specs = append(specs,
 			tpSpec{prog: "trace_openat", group: "syscalls", name: "sys_enter_openat"},
 			tpSpec{prog: "trace_openat2", group: "syscalls", name: "sys_enter_openat2", optional: true},
@@ -154,10 +161,12 @@ func newEBPFSensor(cfg config.SensorConfig) (Sensor, error) {
 		links:    links,
 		reader:   rd,
 		statsMap: coll.Maps["stats_map"],
+		openHook: openHook,
 	}, nil
 }
 
-func (s *ebpfSensor) Mode() string { return "ebpf" }
+func (s *ebpfSensor) Mode() string     { return "ebpf" }
+func (s *ebpfSensor) OpenHook() string { return s.openHook }
 
 // Dropped returns the sum of kernel ringbuf reserve drops plus userspace channel drops.
 func (s *ebpfSensor) Dropped() uint64 {

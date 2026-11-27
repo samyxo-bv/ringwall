@@ -83,7 +83,29 @@ func TestDecodeRawEventOpenWriteWithDirFD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecodeRawEvent: %v", err)
 	}
-	if ev.Type != model.EventOpen || !ev.IsWrite || ev.DirFD != 5 || ev.Path != "id_ed25519" {
+	if ev.Type != model.EventOpen || !ev.IsWrite || ev.DirFD != 5 || ev.Path != "id_ed25519" || ev.PathResolved {
 		t.Fatalf("unexpected open event: %+v", ev)
+	}
+}
+
+func TestDecodeRawEventOpenResolved(t *testing.T) {
+	var raw RawEvent
+	raw.Type = rawEventOpenResolved
+	raw.PID = 1001
+	raw.DirFD = -100
+	raw.Flags = 0
+	copy(raw.Comm[:], "python3")
+	copy(raw.Path[:], "/home/operator/.ssh/id_ed25519")
+
+	var buf bytes.Buffer
+	if err := binary.Write(&buf, binary.LittleEndian, &raw); err != nil {
+		t.Fatalf("binary.Write: %v", err)
+	}
+	ev, err := DecodeRawEvent(buf.Bytes(), time.Unix(1700000000, 0))
+	if err != nil {
+		t.Fatalf("DecodeRawEvent: %v", err)
+	}
+	if ev.Type != model.EventOpen || ev.IsWrite || !ev.PathResolved || ev.Path != "/home/operator/.ssh/id_ed25519" {
+		t.Fatalf("unexpected resolved open event: %+v", ev)
 	}
 }

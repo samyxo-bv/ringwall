@@ -116,6 +116,30 @@ func TestTrackerPreservesEBPFCmdlineAgainstProcOverwrite(t *testing.T) {
 	}
 }
 
+func TestTrackerDoesNotOverwriteKernelResolvedPathOnSymlinkSwap(t *testing.T) {
+	// Simulates P1-A attack: attacker opens /home/alice/.ssh/id_ed25519, kernel bpf_d_path captures it,
+	// then attacker immediately renames ~/.ssh -> ~/.s and symlinks ~/.ssh -> /tmp before userspace Enrich runs.
+	fr := &fakeProcReader{
+		procs: map[int]model.ProcessInfo{
+			300: {PID: 300, PPID: 1, StartTime: 999, Comm: "python3", Exe: "/usr/bin/python3", Cwd: "/"},
+		},
+		symlinks: map[string]string{
+			"/home/alice/.ssh": "/tmp",
+		},
+	}
+	tr := NewTracker(fr)
+	ev := model.Event{
+		Type:         model.EventOpen,
+		PID:          300,
+		Path:         "/home/alice/.ssh/id_ed25519",
+		PathResolved: true,
+	}
+	tr.Enrich(&ev)
+	if ev.Path != "/home/alice/.ssh/id_ed25519" {
+		t.Fatalf("kernel-resolved bpf_d_path MUST NOT be overwritten by post-open symlink swap, got %q", ev.Path)
+	}
+}
+
 func TestTrackerConcurrentEnrichAndCycleSafe(t *testing.T) {
 	fr := &fakeProcReader{
 		procs: map[int]model.ProcessInfo{

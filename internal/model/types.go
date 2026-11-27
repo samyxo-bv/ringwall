@@ -98,8 +98,9 @@ type Event struct {
 	Comm        string        `json:"comm"`
 	Exe         string        `json:"exe,omitempty"`
 	Cwd         string        `json:"cwd,omitempty"`
-	Path        string        `json:"path,omitempty"`
-	RawPath     string        `json:"raw_path,omitempty"`
+	Path         string        `json:"path,omitempty"`
+	RawPath      string        `json:"raw_path,omitempty"`
+	PathResolved bool          `json:"path_resolved,omitempty"`
 	Cmdline     string        `json:"cmdline,omitempty"`
 	ProcCmdline string        `json:"proc_cmdline,omitempty"`
 	Argv        []string      `json:"argv,omitempty"`

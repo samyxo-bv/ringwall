@@ -223,11 +223,16 @@ func (d *Daemon) writePublicStatus() {
 		return
 	}
 	st := d.Status()
+	openHook := ""
+	if rep, ok := d.sensor.(sensor.OpenHookReporter); ok {
+		openHook = rep.OpenHook()
+	}
 	// Strictly non-sensitive read-only health snapshot (zero tokens, zero secrets).
 	snap := map[string]any{
 		"version":         st.Version,
 		"mode":            st.Mode,
 		"sensor_mode":     st.SensorMode,
+		"open_hook":       openHook,
 		"policy_count":    st.PolicyCount,
 		"events_total":    st.EventsTotal,
 		"dropped_events":  st.DroppedEvents,

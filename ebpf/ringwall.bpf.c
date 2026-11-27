@@ -24,11 +24,12 @@ struct file {
     struct path f_path;
 } __attribute__((preserve_access_index));
 
-#define EVENT_EXEC     1
-#define EVENT_OPENAT   2
-#define EVENT_CONNECT  3
-#define EVENT_SENDTO   4
-#define EVENT_IO_URING 5
+#define EVENT_EXEC          1
+#define EVENT_OPENAT        2
+#define EVENT_CONNECT       3
+#define EVENT_SENDTO        4
+#define EVENT_IO_URING      5
+#define EVENT_OPEN_RESOLVED 6
 
 #define AF_INET  2
 #define AF_INET6 10
@@ -170,6 +171,18 @@ static __always_inline int is_interesting_resolved_path(const char *p, __u32 fla
     }
     if (starts_with_5(p, '/', 'r', 'u', 'n', '/') && p[5] == 'r' && p[6] == 'i') {
         return 1; // /run/ringwall
+    }
+    // Catch any dot-directory component anywhere in the resolved path (/.ssh, /.aws, /.kube,
+    // /.gnupg, /.docker, /.config) — including inside chroot, userns, bind-mounts, or custom homes.
+    #pragma clang loop unroll(disable)
+    for (int i = 0; i < PATH_MAX_LEN - 1; i++) {
+        char c = p[i];
+        if (c == '\0') {
+            break;
+        }
+        if (c == '/' && p[i + 1] == '.') {
+            return 1;
+        }
     }
     return 0;
 }
@@ -422,7 +435,7 @@ int trace_security_file_open(__u64 *ctx) {
         return 0;
     }
 
-    e->type = EVENT_OPENAT;
+    e->type = EVENT_OPEN_RESOLVED;
     e->pid = pid;
     e->uid = (__u32)bpf_get_current_uid_gid();
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
@@ -482,6 +495,30 @@ SEC("tracepoint/syscalls/sys_enter_renameat2")
 int trace_renameat2(struct sys_enter_ctx *ctx) {
     // Check destination (newdfd=args[2], newpath=args[3]) as a write to catch mv into authorized_keys/cron.
     return emit_open((__s32)ctx->args[2], (const void *)ctx->args[3], O_WRONLY | O_CREAT);
+}
+
+SEC("tracepoint/syscalls/sys_enter_link")
+int trace_link(struct sys_enter_ctx *ctx) {
+    // x86_64 link(oldpath=args[0], newpath=args[1]) — catch persistence hardlinks to authorized_keys/cron.
+    return emit_open(AT_FDCWD, (const void *)ctx->args[1], O_WRONLY | O_CREAT);
+}
+
+SEC("tracepoint/syscalls/sys_enter_linkat")
+int trace_linkat(struct sys_enter_ctx *ctx) {
+    // linkat(olddfd=args[0], oldpath=args[1], newdfd=args[2], newpath=args[3], flags=args[4])
+    return emit_open((__s32)ctx->args[2], (const void *)ctx->args[3], O_WRONLY | O_CREAT);
+}
+
+SEC("tracepoint/syscalls/sys_enter_symlink")
+int trace_symlink(struct sys_enter_ctx *ctx) {
+    // x86_64 symlink(target=args[0], linkpath=args[1])
+    return emit_open(AT_FDCWD, (const void *)ctx->args[1], O_WRONLY | O_CREAT);
+}
+
+SEC("tracepoint/syscalls/sys_enter_symlinkat")
+int trace_symlinkat(struct sys_enter_ctx *ctx) {
+    // symlinkat(target=args[0], newdfd=args[1], linkpath=args[2])
+    return emit_open((__s32)ctx->args[1], (const void *)ctx->args[2], O_WRONLY | O_CREAT);
 }
 
 SEC("tracepoint/syscalls/sys_enter_connect")

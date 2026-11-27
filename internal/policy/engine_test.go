@@ -169,6 +169,8 @@ func TestMatchGlobDoubleStar(t *testing.T) {
 	}{
 		{"**/.ssh/id_*", "/home/user/.ssh/id_rsa", true},
 		{"**/.ssh/id_*", "/root/.ssh/id_ed25519", true},
+		{"**/.ssh/id_*", "/.ssh/id_ed25519", true},
+		{"**/.ssh/id_*", "/mnt/.ssh/id_ed25519", true},
 		{"**/.ssh/id_*", "/home/user/.ssh/config", false},
 		{"/etc/shadow", "/etc/shadow", true},
 		{"/etc/cron.d/*", "/etc/cron.d/evil", true},

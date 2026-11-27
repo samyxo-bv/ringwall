@@ -377,13 +377,19 @@ func (t *Tracker) Enrich(ev *model.Event) {
 	rl := func(p string) (string, bool) { return t.reader.ReadLink(ev.PID, p) }
 	if ev.Path != "" {
 		ev.RawPath = ev.Path
-		ev.Path = CanonicalizePath(
-			ev.Path,
-			ev.DirFD,
-			cwd,
-			func(fd int32) (string, bool) { return t.reader.ReadFDPath(ev.PID, fd) },
-			rl,
-		)
+		if ev.PathResolved {
+			// Path was already resolved in-kernel by fentry/security_file_open + bpf_d_path.
+			// Never run asynchronous userspace readlink/CanonicalizePath here (eliminates rename+symlink swap TOCTOU).
+			ev.Path = cleanSlashPath(filepath.ToSlash(ev.Path))
+		} else {
+			ev.Path = CanonicalizePath(
+				ev.Path,
+				ev.DirFD,
+				cwd,
+				func(fd int32) (string, bool) { return t.reader.ReadFDPath(ev.PID, fd) },
+				rl,
+			)
+		}
 	}
 	if ev.Exe != "" {
 		ev.Exe = CanonicalizePath(ev.Exe, atFDCWD, cwd, nil, rl)

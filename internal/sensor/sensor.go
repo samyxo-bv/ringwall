@@ -18,11 +18,12 @@ import (
 var ErrUnsupportedPlatform = errors.New("sensor unsupported on this platform")
 
 const (
-	rawEventExec    uint32 = 1
-	rawEventOpenat  uint32 = 2
-	rawEventConnect uint32 = 3
-	rawEventSendto  uint32 = 4
-	rawEventIOUring uint32 = 5
+	rawEventExec         uint32 = 1
+	rawEventOpenat       uint32 = 2
+	rawEventConnect      uint32 = 3
+	rawEventSendto       uint32 = 4
+	rawEventIOUring      uint32 = 5
+	rawEventOpenResolved uint32 = 6
 
 	rawAFInet  uint16 = 2
 	rawAFInet6 uint16 = 10
@@ -52,6 +53,11 @@ type Sensor interface {
 	Mode() string
 	Dropped() uint64
 	Start(ctx context.Context, out chan<- model.Event) error
+}
+
+// OpenHookReporter is optionally implemented by sensors that expose which open hook is active.
+type OpenHookReporter interface {
+	OpenHook() string
 }
 
 // DecodeRawEvent converts a 1344-byte eBPF ringbuf record into a model.Event.
@@ -91,6 +97,10 @@ func DecodeRawEvent(data []byte, now time.Time) (model.Event, error) {
 	case rawEventOpenat:
 		ev.Type = model.EventOpen
 		ev.IsWrite = (raw.Flags & openWriteMask) != 0
+	case rawEventOpenResolved:
+		ev.Type = model.EventOpen
+		ev.IsWrite = (raw.Flags & openWriteMask) != 0
+		ev.PathResolved = true
 	case rawEventConnect, rawEventSendto:
 		ev.Type = model.EventConnect
 		ev.DstPort = raw.DPort
