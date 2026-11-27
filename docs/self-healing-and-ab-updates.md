@@ -97,7 +97,21 @@ Every virtual patch — whether deterministic, AI-assisted, or operator-submitte
 
 > **Honest scope note:** The bootable live ISO runs from read-only SquashFS on `ringwall.slot=A` (where `ab-keygen`/`ab-sign`/`ab-verify` work live). Full two-partition A/B switching and boot-counter rollback is **experimental** and requires a disk-installed bootloader (GRUB or `systemd-boot`) configured to source `/var/lib/ringwall/ab-boot.env` and pass `ringwall.slot=A` or `ringwall.slot=B` on the kernel command line.
 
-### Generating Keys, Signing & Verifying Releases
+### Official Ringwall by Samyxo Release Public Key
+
+Official GitHub Releases are signed with the Ringwall Ed25519 release key. The public key is published in [`packaging/ringwall-release.pub`](../packaging/ringwall-release.pub):
+
+- **Base64 (32-byte raw Ed25519):** `fMqvPrZoBiWpJMGF1dBoEwH5Iyf44dviQVmbatPL5vQ=`
+- **SHA-256 (raw public key bytes):** `d390de35da3a1ec1eaa8adac0f3aac8669f7ef8be72f23f9ee432f94e62d2571`
+
+Verify an official release manifest (`v0.2.0` and later):
+
+```bash
+curl -fsSLO https://github.com/samyxo-bv/ringwall/releases/download/v0.2.0/ringwall-v0.2.0-ab-manifest.json
+ringwallctl ab-verify packaging/ringwall-release.pub ringwall-v0.2.0-ab-manifest.json v0.1.0
+```
+
+### Generating Your Own Keys, Signing & Verifying Custom Releases
 
 ```bash
 # 1. Generate an offline Ed25519 release signing keypair:
@@ -119,7 +133,7 @@ ringwallctl ab-verify ringwall-release.pub ringwall-v0.2.0-ab-manifest.json v0.1
 
 When `patcher.ab_update.enabled: true` and a verified manifest is staged via `POST /api/v1/ab/stage`:
 1. `ABUpdater` verifies the Ed25519 signature, anti-downgrade (`version > current` and `current >= min_version`), HTTPS URL + redirect validation, exact SHA-256 digest, and exact byte size before writing to the inactive slot (`O_EXCL` symlink-safe temp file + `fsync` + atomic rename).
-2. `ABUpdater` sets `pending_slot` with `tries_remaining: 2` in `/var/lib/ringwall/ab-state.json` and writes `RINGWALL_NEXT_SLOT=B` into `/var/lib/ringwall/ab-boot.env`.
+2. `ABUpdater` sets `pending_slot` with `tries_remaining: 2` in `/var/lib/ringwall/ab-state.json` and writes `RINGWALL_BOOT_SLOT=B` and `RINGWALL_BOOT_TRIES=2` into `/var/lib/ringwall/ab-boot.env`.
 3. On subsequent `ringwalld` startups, `ConfirmBootHealth` reads `/proc/cmdline` for `ringwall.slot=A|B`:
    - If the kernel is **still booted on the old slot** (e.g. a normal daemon restart without rebooting), `ConfirmBootHealth` is a strict no-op — it never falsely promotes an unbooted slot.
    - Once the kernel actually boots `ringwall.slot=B` and `ringwalld` starts healthy (sensor active + policies loaded), slot `B` is promoted to `active_slot` and `last_known_good_slot`.

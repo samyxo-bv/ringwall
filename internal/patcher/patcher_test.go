@@ -434,3 +434,27 @@ func TestSignedABUpdaterRequiresRealBootSlotBeforePromotion(t *testing.T) {
 		t.Fatalf("expected healthy promotion to B v0.2.0, got rolled=%v st=%+v", rolled, st)
 	}
 }
+
+func TestOfficialReleasePubKeyVerifiesV020Manifest(t *testing.T) {
+	pubBytes, err := os.ReadFile(filepath.Join("..", "..", "packaging", "ringwall-release.pub"))
+	if err != nil {
+		t.Fatalf("read official release public key: %v", err)
+	}
+	pub := strings.TrimSpace(string(pubBytes))
+	manifest := ABManifest{
+		Version:             "v0.2.0",
+		ReleaseURL:          "https://github.com/samyxo-bv/ringwall/releases/download/v0.2.0/ringwall-v0.2.0-appliance-amd64.iso",
+		ImageSHA256:         "aa779c1b5e119df6c1b960340fabd88c51df14716ee2f25b936075a04a60e5b9",
+		ImageSize:           203780096,
+		PublishedAt:         "2026-11-27T09:14:49Z",
+		SignatureEd25519B64: "vXQUkUhWIUsJ8vgr/53RV8jesco0TFVjaN6x5me+FuJ9qnbM4uGAhZV5vV3n4h2mZNXNrO3Rkv7cq58YkP4wDg==",
+	}
+	if err := VerifyManifest(pub, "v0.1.0", manifest); err != nil {
+		t.Fatalf("official release pubkey failed to verify v0.2.0 manifest: %v", err)
+	}
+	tampered := manifest
+	tampered.ImageSize++
+	if err := VerifyManifest(pub, "v0.1.0", tampered); err == nil {
+		t.Fatalf("expected tampered v0.2.0 manifest rejected")
+	}
+}

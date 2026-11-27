@@ -44,9 +44,9 @@ Ringwall loads `/etc/ringwall/ringwall.yaml` (`0600 root:root`) by default. Over
 | `ai_virtual_patch` | `true` | Allow uncensored AI Guardian to propose declarative virtual patches (always validated against hard anti-lockout rules; deterministic fallback if AI disabled/unavailable) |
 | `virtual_patch_file` | `/var/lib/ringwall/virtual-patches.json` | Persisted `0600` JSON store for active TTL-bounded virtual patches (must stay outside `policy_dirs`) |
 | `ab_update.enabled` | `false` | Opt-in Ed25519 A/B slot staging & boot-health confirmation (experimental for disk-installed GRUB/systemd-boot appliances) |
-| `ab_update.trusted_pubkey_ed25519_b64` | `""` | Base64-encoded Ed25519 public key verifying A/B manifests |
+| `ab_update.trusted_pubkey_ed25519_b64` | `""` | Base64-encoded Ed25519 public key verifying A/B manifests (official Ringwall key: [`packaging/ringwall-release.pub`](../packaging/ringwall-release.pub)) |
 | `ab_update.state_path` | `/var/lib/ringwall/ab-state.json` | Atomic A/B slot state and boot-counter file (`0600`) |
-| `ab_update.boot_env_path` | `/var/lib/ringwall/ab-boot.env` | Bootloader slot selector env file (`RINGWALL_NEXT_SLOT=A\|B`) |
+| `ab_update.boot_env_path` | `/var/lib/ringwall/ab-boot.env` | Bootloader slot selector env file (`RINGWALL_BOOT_SLOT=A\|B`, `RINGWALL_BOOT_TRIES=<n>`) |
 | `ab_update.slot_a_path` / `slot_b_path` | `/var/lib/ringwall/slot_a.squashfs` / `slot_b.squashfs` | Inactive slot staging image paths |
 
 ### `enforcer`

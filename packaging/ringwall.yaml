@@ -37,7 +37,8 @@ patcher:
     enabled: false
     state_path: /var/lib/ringwall/ab-state.json
     boot_env_path: /var/lib/ringwall/ab-boot.env
-    # trusted_pubkey_ed25519_b64: ""
+    # Official Ringwall by Samyxo Ed25519 release public key (also in packaging/ringwall-release.pub):
+    # trusted_pubkey_ed25519_b64: "fMqvPrZoBiWpJMGF1dBoEwH5Iyf44dviQVmbatPL5vQ="
 
 enforcer:
   enable_signals: true
