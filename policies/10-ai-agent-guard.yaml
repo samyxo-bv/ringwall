@@ -18,7 +18,6 @@ rules:
       exclude_path_globs:
         - '**/.ssh/*.pub'
       exclude_exe_paths:
-        - '/usr/bin/ssh'
         - '/usr/bin/ssh-agent'
         - '/usr/bin/ssh-add'
         - '/usr/bin/ssh-keygen'

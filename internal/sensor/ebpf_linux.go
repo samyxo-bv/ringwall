@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -34,20 +35,26 @@ type bpfFileKey struct {
 	Pad uint32
 }
 
+// bpfExecDenyVal matches struct exec_deny_val in ebpf/ringwall.bpf.c byte-for-byte.
+type bpfExecDenyVal struct {
+	HasGen uint32
+	Gen    uint32
+}
+
 type ebpfSensor struct {
-	coll              *ebpf.Collection
-	links             []link.Link
-	reader            *ringbuf.Reader
-	configMap         *ebpf.Map
-	statsMap          *ebpf.Map
-	denyExecMap       *ebpf.Map
-	openHook          string
-	lsmAttached       bool
-	lsmEnforce        atomic.Bool
-	execMapMu         sync.Mutex
-	pinnedExecKeys    map[bpfFileKey]struct{}
-	protectedExecKeys map[bpfFileKey]struct{}
-	chanDrops         atomic.Uint64
+	coll               *ebpf.Collection
+	links              []link.Link
+	reader             *ringbuf.Reader
+	configMap          *ebpf.Map
+	statsMap           *ebpf.Map
+	denyExecMap        *ebpf.Map
+	openHook           string
+	lsmAttached        bool
+	lsmEnforce         atomic.Bool
+	execMapMu          sync.Mutex
+	pinnedExecKeys     map[bpfFileKey]struct{}
+	protectedExecPaths []string
+	chanDrops          atomic.Uint64
 }
 
 func bpfLSMAvailable() bool {
@@ -91,21 +98,34 @@ func fileKeysForPath(p string) []bpfFileKey {
 	return keys
 }
 
-// regularFileKeysNoFollow atomically opens p with O_PATH|O_NOFOLLOW|O_CLOEXEC and Fstats the
-// exact opened inode, rejecting symlinks and non-regular files (closes P1-B symlink TOCTOU).
-func regularFileKeysNoFollow(p string) []bpfFileKey {
-	fd, err := unix.Open(p, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+// regularFileKeysNoFollow opens p with O_NOFOLLOW|O_CLOEXEC (refusing final-component symlinks),
+// Fstats the exact opened inode verifying S_IFREG, and reads FS_IOC_GETVERSION (i_generation) on
+// persistent filesystems (ext4/xfs/btrfs) so reused inode numbers never falsely block newer binaries (P1-1).
+func regularFileKeysNoFollow(p string) ([]bpfFileKey, bpfExecDenyVal) {
+	var denyVal bpfExecDenyVal
+	fd, err := unix.Open(p, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	readable := err == nil
 	if err != nil {
-		return nil
+		fd, err = unix.Open(p, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if err != nil {
+			return nil, denyVal
+		}
 	}
 	defer unix.Close(fd)
 
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
-		return nil
+		return nil, denyVal
 	}
 	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Ino == 0 {
-		return nil
+		return nil, denyVal
+	}
+	if readable {
+		// Linux FS_IOC_GETVERSION = _IOR('v', 1, long) (0x80087601 on 64-bit, 0x80047601 on 32-bit).
+		fsIOCGetVersion := uint(0x80007601) | (uint(unsafe.Sizeof(uintptr(0))) << 16)
+		if gen, gerr := unix.IoctlGetInt(fd, fsIOCGetVersion); gerr == nil {
+			denyVal = bpfExecDenyVal{HasGen: 1, Gen: uint32(gen)}
+		}
 	}
 	toKernelDev := func(rawDev uint64) uint32 {
 		return uint32((unix.Major(rawDev) << 20) | (unix.Minor(rawDev) & 0xfffff))
@@ -121,19 +141,22 @@ func regularFileKeysNoFollow(p string) []bpfFileKey {
 			}
 		}
 	}
-	return keys
+	return keys, denyVal
 }
 
-func populateAllowedSSHExes(m *ebpf.Map) int {
+func populateAllowedSSHExes(m *ebpf.Map, configured []string) int {
 	if m == nil {
 		return 0
 	}
-	candidates := []string{
-		"/usr/bin/ssh",
-		"/usr/bin/ssh-agent",
-		"/usr/bin/ssh-add",
-		"/usr/bin/ssh-keygen",
-		"/bin/ssh",
+	// Default omits /usr/bin/ssh (defeats GTFOBins `ssh -F ~/.ssh/id_ed25519 x` key leak, P1-2).
+	// Operators can opt into direct ssh or pass an empty slice [] for zero exemptions via sensor.lsm_allowed_ssh_exes.
+	candidates := configured
+	if candidates == nil {
+		candidates = []string{
+			"/usr/bin/ssh-agent",
+			"/usr/bin/ssh-add",
+			"/usr/bin/ssh-keygen",
+		}
 	}
 	val := uint32(1)
 	added := 0
@@ -261,7 +284,7 @@ func newEBPFSensor(cfg config.SensorConfig) (Sensor, error) {
 	// Tier 1: Synchronous eBPF LSM pre-syscall blocking (when booted with lsm=...,bpf).
 	if lsmReady {
 		if prog := coll.Programs["trace_lsm_file_open"]; prog != nil {
-			sshCount := populateAllowedSSHExes(coll.Maps["allowed_ssh_exe_inodes"])
+			sshCount := populateAllowedSSHExes(coll.Maps["allowed_ssh_exe_inodes"], cfg.LSMAllowedSSHExes)
 			pinCount := populatePinnedSecretInodes(coll.Maps["lsm_deny_file_inodes"])
 			l, attachErr := link.AttachLSM(link.LSMOptions{Program: prog})
 			if attachErr != nil {
@@ -420,22 +443,46 @@ func (s *ebpfSensor) SetLSMEnforce(enabled bool) error {
 	return nil
 }
 
-// SetProtectedExecPaths records live (s_dev, i_ino) keys of protected system binaries so
-// SyncBlockedExecPaths physically refuses to insert any protected binary into lsm_deny_exec_inodes.
+// SetProtectedExecPaths stores the protected system binary paths to be re-statted live on every
+// SyncBlockedExecPaths call so newly upgraded system binaries can never be blocked (P1-1).
 func (s *ebpfSensor) SetProtectedExecPaths(paths []string) {
 	s.execMapMu.Lock()
 	defer s.execMapMu.Unlock()
-	next := make(map[bpfFileKey]struct{}, len(paths)*2)
-	for _, p := range paths {
+	cp := make([]string, len(paths))
+	copy(cp, paths)
+	s.protectedExecPaths = cp
+}
+
+func (s *ebpfSensor) liveProtectedExecKeysLocked() map[bpfFileKey]struct{} {
+	keys := make(map[bpfFileKey]struct{}, len(s.protectedExecPaths)*2)
+	add := func(p string) {
 		for _, k := range fileKeysForPath(p) {
-			next[k] = struct{}{}
+			keys[k] = struct{}{}
 		}
 	}
-	s.protectedExecKeys = next
+	for _, p := range s.protectedExecPaths {
+		add(p)
+	}
+	for _, pat := range []string{
+		"/lib/systemd/systemd*",
+		"/usr/lib/systemd/systemd*",
+		"/usr/lib/openssh/*",
+		"/lib/openssh/*",
+		"/usr/libexec/openssh/*",
+	} {
+		if matches, err := filepath.Glob(pat); err == nil {
+			for _, m := range matches {
+				add(m)
+			}
+		}
+	}
+	return keys
 }
 
 // SyncBlockedExecPaths reconciles lsm_deny_exec_inodes with active zero-day virtual-patched executable paths.
-// Uses atomic O_PATH|O_NOFOLLOW + protected-inode filtering to defeat post-validation symlink swaps (P1-B).
+// Re-stats protected binaries live on every call, removes any stale entry matching a freshly-statted
+// protected inode, uses O_NOFOLLOW on the final path component, and attaches FS_IOC_GETVERSION
+// i_generation where supported so reused inode numbers never block upgraded system binaries (P1-1 / P1-B).
 func (s *ebpfSensor) SyncBlockedExecPaths(paths []string) (int, error) {
 	if !s.lsmAttached || s.denyExecMap == nil {
 		return 0, nil
@@ -443,12 +490,13 @@ func (s *ebpfSensor) SyncBlockedExecPaths(paths []string) (int, error) {
 	s.execMapMu.Lock()
 	defer s.execMapMu.Unlock()
 
-	desired := make(map[bpfFileKey]struct{})
+	protectedKeys := s.liveProtectedExecKeysLocked()
+	desired := make(map[bpfFileKey]bpfExecDenyVal)
 	for _, p := range paths {
-		keys := regularFileKeysNoFollow(p)
+		keys, denyVal := regularFileKeysNoFollow(p)
 		protected := false
 		for _, k := range keys {
-			if _, hit := s.protectedExecKeys[k]; hit {
+			if _, hit := protectedKeys[k]; hit {
 				protected = true
 				break
 			}
@@ -457,18 +505,20 @@ func (s *ebpfSensor) SyncBlockedExecPaths(paths []string) (int, error) {
 			continue
 		}
 		for _, k := range keys {
-			desired[k] = struct{}{}
+			desired[k] = denyVal
 		}
 	}
 	for old := range s.pinnedExecKeys {
-		if _, keep := desired[old]; !keep {
+		_, keep := desired[old]
+		_, isProt := protectedKeys[old]
+		if !keep || isProt {
 			_ = s.denyExecMap.Delete(&old)
 			delete(s.pinnedExecKeys, old)
 		}
 	}
-	val := uint32(1)
-	for k := range desired {
-		if err := s.denyExecMap.Put(&k, &val); err == nil {
+	for k, val := range desired {
+		v := val
+		if err := s.denyExecMap.Put(&k, &v); err == nil {
 			s.pinnedExecKeys[k] = struct{}{}
 		}
 	}

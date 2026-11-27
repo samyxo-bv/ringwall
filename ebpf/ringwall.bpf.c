@@ -38,6 +38,7 @@ struct inode {
     __u16 i_mode;
     kuid_t i_uid;
     unsigned long i_ino;
+    __u32 i_generation;
     struct super_block *i_sb;
 } __attribute__((preserve_access_index));
 
@@ -115,6 +116,13 @@ struct file_key {
     __u32 _pad;
 };
 
+// Optional inode generation guard (FS_IOC_GETVERSION on ext4/xfs/btrfs) prevents reused inodes
+// after package upgrades from ever falsely blocking newly installed system binaries (P1-1).
+struct exec_deny_val {
+    __u32 has_gen;
+    __u32 gen;
+};
+
 struct path_buf {
     char data[PATH_MAX_LEN];
 };
@@ -178,7 +186,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 256);
     __type(key, struct file_key);
-    __type(value, __u32);
+    __type(value, struct exec_deny_val);
 } lsm_deny_exec_inodes SEC(".maps");
 
 static __always_inline void record_drop(void) {
@@ -684,8 +692,8 @@ int trace_lsm_mmap_file(__u64 *ctx) {
     __u16 mode = 0;
     bpf_probe_read_kernel(&owner_uid, sizeof(owner_uid), __builtin_preserve_access_index(&ino_p->i_uid.val));
     bpf_probe_read_kernel(&mode, sizeof(mode), __builtin_preserve_access_index(&ino_p->i_mode));
-    if (owner_uid != 0 || (mode & 0002)) {
-        return -1; // -EPERM: refuse executable mapping of untrusted library into allowlisted SSH binary
+    if (owner_uid != 0 || (mode & 0022)) {
+        return -1; // -EPERM: refuse executable mapping of untrusted/writable library into allowlisted SSH binary
     }
     return 0;
 }
@@ -728,8 +736,20 @@ int trace_lsm_bprm_check(__u64 *ctx) {
     if (!get_file_key(file, &fk)) {
         return 0;
     }
-    if (!bpf_map_lookup_elem(&lsm_deny_exec_inodes, &fk)) {
+    struct exec_deny_val *dv = bpf_map_lookup_elem(&lsm_deny_exec_inodes, &fk);
+    if (!dv) {
         return 0;
+    }
+    if (dv->has_gen != 0) {
+        struct inode *ino_p = 0;
+        bpf_probe_read_kernel(&ino_p, sizeof(ino_p), __builtin_preserve_access_index(&file->f_inode));
+        if (ino_p) {
+            __u32 cur_gen = 0;
+            bpf_probe_read_kernel(&cur_gen, sizeof(cur_gen), __builtin_preserve_access_index(&ino_p->i_generation));
+            if (cur_gen != dv->gen) {
+                return 0; // Inode number was reused by a newer file (e.g. apt upgrade): do not block!
+            }
+        }
     }
 
     struct ringwall_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);

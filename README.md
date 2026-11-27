@@ -98,7 +98,7 @@ Ringwall ships an automated **hybrid BIOS + UEFI bootable Linux appliance ISO** 
 
 ### Live QEMU & Host Verification (16 Live ISO + Host LSM Assertions on Every CI & Release Run)
 
-Every CI run verifies `lsm/mmap_file` (`LD_PRELOAD` into `/usr/bin/ssh-keygen` -> `EPERM`) and `lsm/bprm_check_security` (live virtual-patch block & revoke) on the Linux host, AND boots the freshly built `.iso` headless in QEMU as unprivileged `operator` to prove live inside the VM:
+Every CI run verifies `lsm/mmap_file` (`LD_PRELOAD` main/pthread/fork into `/usr/bin/ssh-keygen` blocked at `ld.so` map time while normal `ssh-keygen` works), `ssh -F` GTFOBins key-leak blocking (`-EPERM`), pre-exec `PTRACE_TRACEME` (`task->ptrace != 0`) exemption revocation, and `lsm/bprm_check_security` (live tmpfs + ext4 `i_generation` virtual-patch block & revoke) on the Linux host, AND boots the freshly built `.iso` headless in QEMU as unprivileged `operator` to prove live inside the VM:
 1. Read-only SquashFS + no `sshd`; `open_hook: lsm/file_open`, `lsm_enforce_active: true`, and `ringwall.slot=A`.
 2. Monitored `operator` cannot read `/run/ringwall/api.token` or `/var/log/ringwall/audit.jsonl` and gets HTTP `401`.
 3. Direct SSH key read, `/usr/../home` traversal, `//home` traversal, **hardlinks (preexisting + new)**, **spoofed `/tmp/ssh` copies**, directory symlinks, cwd-relative opens, non-`/home` dot-paths (`/tmp/alt/.ssh/id_ed25519`), and **reads during a live UDP ringbuf-saturation flood** are **ALL blocked synchronously by the kernel with `EPERM` (0 bytes leaked)**.

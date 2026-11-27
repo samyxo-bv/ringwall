@@ -173,6 +173,7 @@ type VirtualPatchManager struct {
 	mu              sync.RWMutex
 	persistMu       sync.Mutex
 	patches         map[string]VirtualPatch
+	extraProtected  []string
 	protectedInodes map[inodeID]string
 	protectedPaths  map[string]bool
 	engine          *policy.Engine
@@ -274,12 +275,35 @@ func (m *VirtualPatchManager) IsProtectedExe(pid int, exe string) bool {
 func (m *VirtualPatchManager) AddProtectedBinaryForTest(p string) {
 	m.mu.Lock()
 	clean := filepath.ToSlash(filepath.Clean(p))
+	m.extraProtected = append(m.extraProtected, clean)
 	m.protectedPaths[clean] = true
 	if id, ok := statInodeID(clean); ok {
 		m.protectedInodes[id] = clean
 	}
 	m.mu.Unlock()
 	m.syncProtectedToBlocker()
+}
+
+// RefreshAndSync rebuilds the live protected binary/inode index from disk (catching binaries
+// replaced by apt-get or unattended-upgrades) and reconciles lsm_deny_exec_inodes so reused or
+// newly upgraded system binary inodes are NEVER blocked (P1-1).
+func (m *VirtualPatchManager) RefreshAndSync() {
+	m.mu.RLock()
+	extra := append([]string(nil), m.extraProtected...)
+	m.mu.RUnlock()
+
+	freshPaths, freshInodes := buildProtectedBinaryIndex("/etc/shells", extra)
+
+	m.mu.Lock()
+	m.protectedPaths = freshPaths
+	m.protectedInodes = freshInodes
+	allExecs := m.collectBlockedExecPathsLocked(time.Now().UTC())
+	m.mu.Unlock()
+
+	m.syncProtectedToBlocker()
+	if m.blocker != nil {
+		_, _ = m.blocker.SyncBlockedExecPaths(allExecs)
+	}
 }
 
 func buildProtectedBinaryIndex(shellsPath string, extra []string) (map[string]bool, map[inodeID]string) {

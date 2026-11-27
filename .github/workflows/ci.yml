@@ -96,8 +96,42 @@ jobs:
           }
           CEOF
           clang -shared -fPIC -O2 -pthread "${TMPDIR}/ldp/evil.c" -o "${TMPDIR}/ldp/evil.so"
+          cat > "${TMPDIR}/ldp/ptrace_test.c" <<'PCEOF'
+          #include <signal.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <sys/ptrace.h>
+          #include <sys/wait.h>
+          #include <unistd.h>
+          int main(int argc, char **argv) {
+              if (argc < 2) return 2;
+              pid_t pid = fork();
+              if (pid == 0) {
+                  if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0) {
+                      perror("PTRACE_TRACEME");
+                      _exit(91);
+                  }
+                  raise(SIGSTOP);
+                  char *args[] = { "/usr/bin/ssh-keygen", "-y", "-f", argv[1], NULL };
+                  execv("/usr/bin/ssh-keygen", args);
+                  perror("execv");
+                  _exit(92);
+              }
+              int status = 0;
+              while (waitpid(pid, &status, 0) > 0) {
+                  if (WIFEXITED(status) || WIFSIGNALED(status)) break;
+                  if (WIFSTOPPED(status)) {
+                      ptrace(PTRACE_CONT, pid, NULL, NULL);
+                  }
+              }
+              return 0;
+          }
+          PCEOF
+          clang -O2 "${TMPDIR}/ldp/ptrace_test.c" -o "${TMPDIR}/ldp/ptrace_test"
           cp /bin/true "${TMPDIR}/vp-target-bin"
           chmod 0755 "${TMPDIR}/vp-target-bin"
+          cp /bin/true "${PWD}/.rw-ext4-vp-bin"
+          chmod 0755 "${PWD}/.rw-ext4-vp-bin"
 
           cat > "${TMPDIR}/ringwall.yaml" <<EOF
           mode: interactive
@@ -124,7 +158,7 @@ jobs:
           EOF
           sudo ./bin/ringwalld -config "${TMPDIR}/ringwall.yaml" 2>"${TMPDIR}/daemon.log" &
           DPID=$!
-          trap "cat ${TMPDIR}/daemon.log || true; sudo kill $DPID 2>/dev/null || true; sleep 0.5; sudo rm -rf ${TMPDIR}" EXIT
+          trap "cat ${TMPDIR}/daemon.log || true; sudo kill $DPID 2>/dev/null || true; sleep 0.5; sudo rm -rf ${TMPDIR}; rm -f ${PWD}/.rw-ext4-vp-bin" EXIT
           for i in $(seq 1 20); do sudo test -f "${TMPDIR}/run/api.token" && break; sleep 0.5; done
           PERM="$(sudo stat -c '%a' "${TMPDIR}/run/api.token")"
           test "${PERM}" = "600"
@@ -153,27 +187,52 @@ jobs:
             /usr/bin/ssh-keygen -t ed25519 -N "" -f "${TMPDIR}/legit_key" >/dev/null
             test -f "${TMPDIR}/legit_key.pub"
 
-            # Live lsm/bprm_check_security proof: virtual-patched binary blocked pre-exec -> unblocked on DELETE!
-            TOKEN="$(sudo cat "${TMPDIR}/run/api.token")"
-            "${TMPDIR}/vp-target-bin"
-            curl -fsS -X POST -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json" \
-              -d "{\"id\":\"VP-LIVE-TEST\",\"cve\":\"CVE-2099-9999\",\"package\":\"vp-test\",\"target_exe_paths\":[\"${TMPDIR}/vp-target-bin\"],\"action\":\"freeze\",\"source\":\"operator\",\"rationale\":\"live CI LSM bprm verification\"}" \
-              http://127.0.0.1:19443/api/v1/virtual-patches
-            python3 -c 'import os, sys; exec("try:\n os.execv(sys.argv[1], [sys.argv[1]])\nexcept OSError as e:\n print(\"VP_EXEC_ERRNO=\" + str(e.errno), flush=True)")' "${TMPDIR}/vp-target-bin" >"${TMPDIR}/vp_out" 2>&1 &
-            VPID=$!
+            # Live P1-2 proof: ssh -F <private_key> GTFOBins leak is synchronously blocked (-EPERM, 0 bytes leaked)!
+            /usr/bin/ssh -F "${TMPDIR}/ldp/.ssh/id_ed25519" x >"${TMPDIR}/sshf_out" 2>&1 &
+            SPID=$!
             for _ in $(seq 1 12); do
-              [ -s "${TMPDIR}/vp_out" ] && break
-              grep -q '(stopped)' /proc/$VPID/status 2>/dev/null && kill -CONT $VPID 2>/dev/null || true
+              [ -s "${TMPDIR}/sshf_out" ] && break
+              grep -q '(stopped)' /proc/$SPID/status 2>/dev/null && kill -CONT $SPID 2>/dev/null || true
               sleep 0.25
             done
-            kill -9 $VPID 2>/dev/null || true
-            wait $VPID 2>/dev/null || true
-            cat "${TMPDIR}/vp_out"
-            grep -q "VP_EXEC_ERRNO=1" "${TMPDIR}/vp_out"
+            kill -9 $SPID 2>/dev/null || true
+            wait $SPID 2>/dev/null || true
+            cat "${TMPDIR}/sshf_out"
+            grep -qiE "(Operation not permitted|Permission denied)" "${TMPDIR}/sshf_out"
+            ! grep -qi "ringwall-ldp-decoy" "${TMPDIR}/sshf_out"
+
+            # Live P2-1 proof: pre-exec PTRACE_TRACEME revokes allowlisted ssh-keygen exemption via task->ptrace != 0!
+            timeout 10 "${TMPDIR}/ldp/ptrace_test" "${TMPDIR}/ldp/.ssh/id_ed25519" >"${TMPDIR}/pt_out" 2>&1 || true
+            cat "${TMPDIR}/pt_out"
+            grep -qiE "(Operation not permitted|Permission denied)" "${TMPDIR}/pt_out"
+            ! grep -qi "ringwall-ldp-decoy" "${TMPDIR}/pt_out"
+
+            # Live lsm/bprm_check_security proof (both tmpfs AND ext4 with FS_IOC_GETVERSION i_generation):
+            TOKEN="$(sudo cat "${TMPDIR}/run/api.token")"
+            "${TMPDIR}/vp-target-bin"
+            "${PWD}/.rw-ext4-vp-bin"
+            curl -fsS -X POST -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json" \
+              -d "{\"id\":\"VP-LIVE-TEST\",\"cve\":\"CVE-2099-9999\",\"package\":\"vp-test\",\"target_exe_paths\":[\"${TMPDIR}/vp-target-bin\",\"${PWD}/.rw-ext4-vp-bin\"],\"action\":\"freeze\",\"source\":\"operator\",\"rationale\":\"live CI LSM bprm verification\"}" \
+              http://127.0.0.1:19443/api/v1/virtual-patches
+            for BIN in "${TMPDIR}/vp-target-bin" "${PWD}/.rw-ext4-vp-bin"; do
+              rm -f "${TMPDIR}/vp_out"
+              python3 -c 'import os, sys; exec("try:\n os.execv(sys.argv[1], [sys.argv[1]])\nexcept OSError as e:\n print(\"VP_EXEC_ERRNO=\" + str(e.errno), flush=True)")' "${BIN}" >"${TMPDIR}/vp_out" 2>&1 &
+              VPID=$!
+              for _ in $(seq 1 12); do
+                [ -s "${TMPDIR}/vp_out" ] && break
+                grep -q '(stopped)' /proc/$VPID/status 2>/dev/null && kill -CONT $VPID 2>/dev/null || true
+                sleep 0.25
+              done
+              kill -9 $VPID 2>/dev/null || true
+              wait $VPID 2>/dev/null || true
+              cat "${TMPDIR}/vp_out"
+              grep -q "VP_EXEC_ERRNO=1" "${TMPDIR}/vp_out"
+            done
             curl -fsS -X DELETE -H "Authorization: Bearer ${TOKEN}" \
               http://127.0.0.1:19443/api/v1/virtual-patches/VP-LIVE-TEST
             "${TMPDIR}/vp-target-bin"
-            echo "LIVE_LSM_MMAP_AND_BPRM_PROOFS_OK"
+            "${PWD}/.rw-ext4-vp-bin"
+            echo "LIVE_LSM_MMAP_PTRACE_SSHF_AND_BPRM_PROOFS_OK"
           fi
 
       - name: Upload compiled Linux binaries

@@ -18,6 +18,7 @@ sensor:
   bpf_object_path: /usr/lib/ringwall/ringwall.bpf.o
   poll_interval_ms: 250
   enable_lsm_blocking: true # Synchronous -EPERM kernel blocking when booted with lsm=...,bpf (disabled automatically in audit mode)
+  # lsm_allowed_ssh_exes: ["/usr/bin/ssh-agent", "/usr/bin/ssh-add", "/usr/bin/ssh-keygen"] # Omit /usr/bin/ssh by default (defeats ssh -F key leak); set [] for zero exemptions
 
 scanner:
   enabled: true

@@ -32,10 +32,11 @@ type Config struct {
 }
 
 type SensorConfig struct {
-	Mode              string `yaml:"mode"` // auto | ebpf | procfs | none
-	BPFObjectPath     string `yaml:"bpf_object_path"`
-	PollIntervalMS    int    `yaml:"poll_interval_ms"`
-	EnableLSMBlocking bool   `yaml:"enable_lsm_blocking"`
+	Mode              string   `yaml:"mode"` // auto | ebpf | procfs | none
+	BPFObjectPath     string   `yaml:"bpf_object_path"`
+	PollIntervalMS    int      `yaml:"poll_interval_ms"`
+	EnableLSMBlocking bool     `yaml:"enable_lsm_blocking"`
+	LSMAllowedSSHExes []string `yaml:"lsm_allowed_ssh_exes,omitempty"` // nil = default [ssh-agent, ssh-add, ssh-keygen]; [] = zero exemptions
 }
 
 type ScannerConfig struct {

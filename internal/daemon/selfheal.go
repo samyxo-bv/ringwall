@@ -132,6 +132,7 @@ func (d *Daemon) RunScan(ctx context.Context) scanner.ScanReport {
 	var revoked []string
 	if vpMgr != nil {
 		revoked = vpMgr.Reconcile(rep, time.Now().UTC())
+		vpMgr.RefreshAndSync()
 	}
 
 	d.selfHealMu.Lock()
@@ -218,6 +219,11 @@ func (d *Daemon) RunPatchCycle(ctx context.Context, dryRunOverride *bool) patche
 		}
 		if len(toPatch) > 0 {
 			summary.PackageResults = patcher.PatchPackages(ctx, runner, toPatch, dryRun)
+			if !dryRun && vpMgr != nil {
+				// Immediately refresh protected binary inodes and sync lsm_deny_exec_inodes after
+				// apt-get upgrades so freed/reused inodes can never falsely block upgraded binaries (P1-1).
+				vpMgr.RefreshAndSync()
+			}
 			if cfg.Patcher.RestartStaleServices {
 				stale := scanner.DetectStaleProcesses("/proc")
 				if len(stale) == 0 {

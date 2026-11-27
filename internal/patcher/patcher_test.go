@@ -209,6 +209,36 @@ func TestVirtualPatchP0AntiLockoutSymlinksAliasesGlobsPortsAndAIKill(t *testing.
 			t.Fatalf("P1-B REGRESSION: symlink-swapped targetBin was still passed to SyncBlockedExecPaths: %+v", blocker.synced)
 		}
 	}
+
+	// P1-1 REGRESSION: RefreshAndSync clears unlinked/upgraded targets and preserves protected binaries.
+	freshTarget := filepath.Join(dir, "upgrade-target")
+	_ = os.WriteFile(freshTarget, []byte("#!/bin/sh\n"), 0o755)
+	if _, err := mgr.Apply(VirtualPatch{
+		ID:             "VP-UPGRADE-TARGET",
+		CVE:            "CVE-2026-55556",
+		Package:        "upgrade-target",
+		TargetExePaths: []string{freshTarget},
+		Action:         model.ActionFreeze,
+		Source:         "operator",
+		ExpiresAt:      time.Now().UTC().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("Apply VP-UPGRADE-TARGET: %v", err)
+	}
+	// P2-a REGRESSION: EventExec with non-zero PID pointing to current process must NOT skip target Exe!
+	if matches, act, _ := eng.Evaluate(model.Event{
+		Type: model.EventExec,
+		PID:  os.Getpid(),
+		Exe:  filepath.ToSlash(freshTarget),
+	}); len(matches) != 1 || act != model.ActionFreeze {
+		t.Fatalf("P2-a REGRESSION: EventExec virtual patch was skipped on non-protected target: matches=%+v act=%s", matches, act)
+	}
+	_ = os.Remove(freshTarget)
+	mgr.RefreshAndSync()
+	for _, s := range blocker.synced {
+		if s == filepath.ToSlash(freshTarget) {
+			t.Fatalf("P1-1 REGRESSION: unlinked target still present after RefreshAndSync: %+v", blocker.synced)
+		}
+	}
 }
 
 func TestVirtualPatchFailClosedReconcileAndRestartPersistence(t *testing.T) {

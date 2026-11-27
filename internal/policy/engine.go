@@ -263,7 +263,6 @@ func (e *Engine) Evaluate(ev model.Event) ([]model.PolicyMatch, model.Action, mo
 	}
 
 	e.mu.RLock()
-	defer e.mu.RUnlock()
 
 	var matches []model.PolicyMatch
 	action := model.ActionAllow
@@ -295,13 +294,46 @@ func (e *Engine) Evaluate(ev model.Event) ([]model.PolicyMatch, model.Action, mo
 	for i := range e.rules {
 		evalOne(&e.rules[i])
 	}
-	if len(e.virtualRules) > 0 && (e.vpExeGuard == nil || !e.vpExeGuard(ev.PID, ev.Exe)) {
-		for _, ve := range e.virtualRules {
-			if !ve.expiresAt.IsZero() && !now.Before(ve.expiresAt) {
-				continue
+
+	// Collect only matching virtual rules under RLock, then release RLock BEFORE calling vpGuard
+	// so filesystem/inode checks never run on non-matching events or block writers (P2-d).
+	var candidateVPs []Rule
+	for _, ve := range e.virtualRules {
+		if !ve.expiresAt.IsZero() && !now.Before(ve.expiresAt) {
+			continue
+		}
+		r := ve.rule
+		if matchesRule(&r, ev) && !e.isRuntimeAllowed(r.ID, ev) {
+			candidateVPs = append(candidateVPs, r)
+		}
+	}
+	vpGuard := e.vpExeGuard
+	e.mu.RUnlock()
+
+	if len(candidateVPs) > 0 {
+		// On sys_enter_execve, /proc/<pid>/exe still points to the parent shell (e.g. bash) before
+		// exec completes; only inspect ev.Exe for EventExec so vulnerable targets are not skipped (P2-a).
+		guardPID := ev.PID
+		if ev.Type == model.EventExec {
+			guardPID = 0
+		}
+		if vpGuard == nil || !vpGuard(guardPID, ev.Exe) {
+			for i := range candidateVPs {
+				r := &candidateVPs[i]
+				matches = append(matches, model.PolicyMatch{
+					RuleID:      r.ID,
+					RuleName:    r.Name,
+					Category:    r.Category,
+					Severity:    r.Severity,
+					Action:      r.Action,
+					Description: r.Description,
+					MITRE:       r.MITRE,
+				})
+				action = model.MaxAction(action, r.Action)
+				if r.Severity.Rank() > severity.Rank() {
+					severity = r.Severity
+				}
 			}
-			r := ve.rule
-			evalOne(&r)
 		}
 	}
 
