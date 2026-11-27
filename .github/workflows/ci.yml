@@ -55,6 +55,7 @@ jobs:
           # Pre-create test fixtures BEFORE starting ringwalld so the step shell itself never opens a /.ssh/id_* path while LSM is active.
           mkdir -p "${TMPDIR}/ldp/.ssh"
           printf 'RINGWALL-LDP-DECOY\n' > "${TMPDIR}/ldp/.ssh/id_ed25519"
+          chmod 0600 "${TMPDIR}/ldp/.ssh/id_ed25519"
           cat > "${TMPDIR}/ldp/evil.c" <<'CEOF'
           #include <errno.h>
           #include <fcntl.h>
