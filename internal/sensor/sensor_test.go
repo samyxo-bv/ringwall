@@ -109,3 +109,35 @@ func TestDecodeRawEventOpenResolved(t *testing.T) {
 		t.Fatalf("unexpected resolved open event: %+v", ev)
 	}
 }
+
+func TestDecodeRawEventLSMBlockedAndLinkDest(t *testing.T) {
+	var raw RawEvent
+	raw.Type = rawEventOpenBlocked
+	raw.PID = 2002
+	raw.DirFD = -100
+	copy(raw.Comm[:], "cat")
+	copy(raw.Path[:], "/home/operator/.ssh/id_ed25519")
+
+	var buf bytes.Buffer
+	_ = binary.Write(&buf, binary.LittleEndian, &raw)
+	ev, err := DecodeRawEvent(buf.Bytes(), time.Unix(1700000000, 0))
+	if err != nil {
+		t.Fatalf("DecodeRawEvent: %v", err)
+	}
+	if !ev.KernelBlocked || !ev.PathResolved || ev.Type != model.EventOpen {
+		t.Fatalf("expected KernelBlocked+PathResolved open event, got %+v", ev)
+	}
+
+	buf.Reset()
+	raw.Type = rawEventLinkDest
+	raw.Flags = 0x0041
+	copy(raw.Path[:], "/home/operator/.ssh/authorized_keys")
+	_ = binary.Write(&buf, binary.LittleEndian, &raw)
+	ev2, err := DecodeRawEvent(buf.Bytes(), time.Unix(1700000000, 0))
+	if err != nil {
+		t.Fatalf("DecodeRawEvent link dest: %v", err)
+	}
+	if !ev2.ResolveParentOnly || !ev2.IsWrite {
+		t.Fatalf("expected ResolveParentOnly+IsWrite on link dest event, got %+v", ev2)
+	}
+}

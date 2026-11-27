@@ -263,6 +263,23 @@ func CanonicalizePath(rawPath string, dirfd int32, cwd string, fdResolver func(i
 	return p
 }
 
+// CanonicalizePathParentOnly canonicalizes a rename/link/symlink destination path by resolving
+// dirfd/cwd//proc prefixes and symlinks on the parent directory ONLY — never following the final leaf.
+func CanonicalizePathParentOnly(rawPath string, dirfd int32, cwd string, fdResolver func(int32) (string, bool), readlink func(string) (string, bool)) string {
+	noLink := CanonicalizePath(rawPath, dirfd, cwd, fdResolver, nil)
+	if readlink == nil || !strings.HasPrefix(noLink, "/") || noLink == "/" {
+		return noLink
+	}
+	idx := strings.LastIndexByte(noLink, '/')
+	if idx <= 0 {
+		return noLink
+	}
+	parent := noLink[:idx]
+	leaf := noLink[idx+1:]
+	resolvedParent := ResolveSymlinksComponentWise(parent, readlink)
+	return cleanSlashPath(strings.TrimRight(resolvedParent, "/") + "/" + leaf)
+}
+
 func cleanSlashPath(p string) string {
 	isAbs := strings.HasPrefix(p, "/")
 	parts := strings.Split(p, "/")
@@ -378,9 +395,19 @@ func (t *Tracker) Enrich(ev *model.Event) {
 	if ev.Path != "" {
 		ev.RawPath = ev.Path
 		if ev.PathResolved {
-			// Path was already resolved in-kernel by fentry/security_file_open + bpf_d_path.
+			// Path was already resolved in-kernel by lsm/file_open or fentry/security_file_open + bpf_d_path.
 			// Never run asynchronous userspace readlink/CanonicalizePath here (eliminates rename+symlink swap TOCTOU).
 			ev.Path = cleanSlashPath(filepath.ToSlash(ev.Path))
+		} else if ev.ResolveParentOnly {
+			// For rename*/link*/symlink* destinations, resolve symlinks ONLY on parent directories so creating
+			// a symlink at ~/.ssh/authorized_keys -> /tmp/evil is never rewritten away from authorized_keys.
+			ev.Path = CanonicalizePathParentOnly(
+				ev.Path,
+				ev.DirFD,
+				cwd,
+				func(fd int32) (string, bool) { return t.reader.ReadFDPath(ev.PID, fd) },
+				rl,
+			)
 		} else {
 			ev.Path = CanonicalizePath(
 				ev.Path,

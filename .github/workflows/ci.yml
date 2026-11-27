@@ -71,10 +71,15 @@ jobs:
           for i in $(seq 1 20); do sudo test -f "${TMPDIR}/run/api.token" && break; sleep 0.5; done
           PERM="$(sudo stat -c '%a' "${TMPDIR}/run/api.token")"
           test "${PERM}" = "600"
-          grep -q "attached fentry/security_file_open" "${TMPDIR}/daemon.log"
+          grep -qE "attached (lsm/file_open|fentry/security_file_open)" "${TMPDIR}/daemon.log"
           sudo ./bin/ringwallctl -api http://127.0.0.1:19443 -token-file "${TMPDIR}/run/api.token" status
+          sudo ./bin/ringwallctl -api http://127.0.0.1:19443 -token-file "${TMPDIR}/run/api.token" scan
+          sudo ./bin/ringwallctl -api http://127.0.0.1:19443 -token-file "${TMPDIR}/run/api.token" patch --dry-run
           sudo ./bin/ringwallctl -api http://127.0.0.1:19443 -token-file "${TMPDIR}/run/api.token" simulate
           sudo ./bin/ringwallctl verify-log "${TMPDIR}/log/audit.jsonl"
+          ./bin/ringwallctl ab-keygen "${TMPDIR}/ab"
+          ./bin/ringwallctl ab-sign "${TMPDIR}/ab.priv" v0.2.0 https://example.com/ringwall.iso ./bin/ringwallctl "${TMPDIR}/ab-manifest.json"
+          ./bin/ringwallctl ab-verify "${TMPDIR}/ab.pub" "${TMPDIR}/ab-manifest.json" v0.1.0
 
       - name: Upload compiled Linux binaries
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -118,7 +123,7 @@ jobs:
       - name: Build hardened immutable bootable ISO
         run: sudo ./iso/build-iso.sh --out dist/ringwall-appliance-amd64.iso
 
-      - name: Boot ISO in QEMU & verify 14 live security assertions
+      - name: Boot ISO in QEMU & verify 15 live LSM + self-healing security assertions
         run: ./iso/test-qemu.sh dist/ringwall-appliance-amd64.iso
 
       - name: Upload verified bootable ISO

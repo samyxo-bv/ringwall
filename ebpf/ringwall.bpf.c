@@ -1,19 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
-// Ringwall Linux eBPF tracing & tracepoint sensor.
-// Primary file-open path uses fentry/security_file_open + bpf_d_path (kernel-resolved VFS path,
-// immune to userspace symlink/cwd/dirfd TOCTOU, .., //, and io_uring IORING_OP_OPENAT).
-// Falls back to hardened syscall open tracepoints on kernels without fentry/BTF support, and always
-// traces execve/execveat, rename/renameat/renameat2, connect/sendto, and io_uring_setup.
+// Ringwall Linux eBPF LSM + tracing + tracepoint sensor (v0.2).
+// Tier 1 (kernels with BPF LSM active, e.g. Ringwall ISO):
+//   - lsm/file_open: synchronous -EPERM pre-read kernel blocking on SSH private keys & pinned secret inodes
+//     (defeats hardlinks, source-renames, and /tmp/ssh comm spoofing via kernel exe inode allowlist) + bpf_d_path.
+//   - lsm/bprm_check_security: synchronous -EPERM execution blocking for zero-day virtual-patched binaries.
+// Tier 2 (BTF kernels without lsm=...,bpf): fentry/security_file_open + bpf_d_path.
+// Tier 3 (older kernels): hardened syscall open tracepoints.
+// Always traces: execve/execveat, rename/renameat/renameat2, link/linkat/symlink/symlinkat, connect/sendto, io_uring_setup.
 
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-// Minimal CO-RE kernel VFS structs for fentry/security_file_open + bpf_d_path.
+// Minimal CO-RE kernel VFS/task structs.
 // Placing f_flags before f_path ensures f_path has a non-zero stub offset so Clang always emits
-// a CO-RE BPF_FIELD_BYTE_OFFSET relocation rather than folding +0.
+// a CO-RE BPF_FIELD_BYTE_OFFSET relocation for bpf_d_path(&file->f_path, ...).
 struct vfsmount;
 struct dentry;
+
+struct super_block {
+    __u32 s_dev;
+} __attribute__((preserve_access_index));
+
+struct inode {
+    unsigned long i_ino;
+    struct super_block *i_sb;
+} __attribute__((preserve_access_index));
+
 struct path {
     struct vfsmount *mnt;
     struct dentry *dentry;
@@ -22,6 +35,19 @@ struct path {
 struct file {
     unsigned int f_flags;
     struct path f_path;
+    struct inode *f_inode;
+} __attribute__((preserve_access_index));
+
+struct mm_struct {
+    struct file *exe_file;
+} __attribute__((preserve_access_index));
+
+struct task_struct {
+    struct mm_struct *mm;
+} __attribute__((preserve_access_index));
+
+struct linux_binprm {
+    struct file *file;
 } __attribute__((preserve_access_index));
 
 #define EVENT_EXEC          1
@@ -30,6 +56,9 @@ struct file {
 #define EVENT_SENDTO        4
 #define EVENT_IO_URING      5
 #define EVENT_OPEN_RESOLVED 6
+#define EVENT_OPEN_BLOCKED  7
+#define EVENT_LINK_DEST     8
+#define EVENT_EXEC_BLOCKED  9
 
 #define AF_INET  2
 #define AF_INET6 10
@@ -64,6 +93,13 @@ struct ringwall_event {
     char  argv[MAX_ARGS][ARG_MAX_LEN];
 };
 
+// Kernel (s_dev, i_ino) identifier immune to hardlinks, symlinks, renames, and comm spoofing.
+struct file_key {
+    __u64 ino;
+    __u32 dev;
+    __u32 _pad;
+};
+
 // Kernel sys_enter tracepoint ABI layout on 64-bit Linux.
 struct sys_enter_ctx {
     __u64 common;
@@ -76,10 +112,11 @@ struct {
     __uint(max_entries, 4 << 20); // 4 MiB ring buffer
 } events SEC(".maps");
 
-// Index 0 stores ringwalld's own PID so the daemon never self-triggers.
+// Index 0: ringwalld's own PID (never self-triggers or self-blocks).
+// Index 1: enforce_lsm (0 = monitor/audit only, 1 = synchronous -EPERM kernel blocking active).
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
+    __uint(max_entries, 2);
     __type(key, __u32);
     __type(value, __u32);
 } config_map SEC(".maps");
@@ -91,6 +128,30 @@ struct {
     __type(key, __u32);
     __type(value, __u64);
 } stats_map SEC(".maps");
+
+// Kernel-verified (s_dev, i_ino) of legitimate SSH binaries allowed to read SSH private keys.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 64);
+    __type(key, struct file_key);
+    __type(value, __u32);
+} allowed_ssh_exe_inodes SEC(".maps");
+
+// Pinned secret file inodes (defeats hardlink & source-rename bypasses synchronously in lsm/file_open).
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 512);
+    __type(key, struct file_key);
+    __type(value, __u32);
+} lsm_deny_file_inodes SEC(".maps");
+
+// Dynamically updated virtual-patch blocked executables (synchronous -EPERM in lsm/bprm_check_security).
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256);
+    __type(key, struct file_key);
+    __type(value, __u32);
+} lsm_deny_exec_inodes SEC(".maps");
 
 static __always_inline void record_drop(void) {
     __u32 key = 0;
@@ -118,12 +179,95 @@ static __always_inline int is_self_pid(__u32 pid) {
     return 0;
 }
 
+static __always_inline int is_lsm_enforce_enabled(void) {
+    __u32 key = 1;
+    __u32 *val = bpf_map_lookup_elem(&config_map, &key);
+    return (val && *val != 0) ? 1 : 0;
+}
+
+static __always_inline int get_file_key(struct file *file, struct file_key *out) {
+    if (!file || !out) {
+        return 0;
+    }
+    struct inode *ino_p = 0;
+    bpf_probe_read_kernel(&ino_p, sizeof(ino_p), __builtin_preserve_access_index(&file->f_inode));
+    if (!ino_p) {
+        return 0;
+    }
+    unsigned long ino = 0;
+    bpf_probe_read_kernel(&ino, sizeof(ino), __builtin_preserve_access_index(&ino_p->i_ino));
+    if (ino == 0) {
+        return 0;
+    }
+    struct super_block *sb = 0;
+    bpf_probe_read_kernel(&sb, sizeof(sb), __builtin_preserve_access_index(&ino_p->i_sb));
+    __u32 dev = 0;
+    if (sb) {
+        bpf_probe_read_kernel(&dev, sizeof(dev), __builtin_preserve_access_index(&sb->s_dev));
+    }
+    out->ino = (__u64)ino;
+    out->dev = dev;
+    out->_pad = 0;
+    return 1;
+}
+
+static __always_inline int is_allowed_ssh_exe(void) {
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    if (!task) {
+        return 0;
+    }
+    struct mm_struct *mm = 0;
+    bpf_probe_read_kernel(&mm, sizeof(mm), __builtin_preserve_access_index(&task->mm));
+    if (!mm) {
+        return 0;
+    }
+    struct file *exe = 0;
+    bpf_probe_read_kernel(&exe, sizeof(exe), __builtin_preserve_access_index(&mm->exe_file));
+    if (!exe) {
+        return 0;
+    }
+    struct file_key ek = {};
+    if (!get_file_key(exe, &ek)) {
+        return 0;
+    }
+    return bpf_map_lookup_elem(&allowed_ssh_exe_inodes, &ek) != 0 ? 1 : 0;
+}
+
 static __always_inline int starts_with_4(const char *s, char a, char b, char c, char d) {
     return s[0] == a && s[1] == b && s[2] == c && s[3] == d;
 }
 
 static __always_inline int starts_with_5(const char *s, char a, char b, char c, char d, char e) {
     return s[0] == a && s[1] == b && s[2] == c && s[3] == d && s[4] == e;
+}
+
+// Single bounded scan matching **/.ssh/id_* (excluding *.pub), **/.ssh/*.pem, and **/.ssh/*.key.
+static __always_inline int is_ssh_private_key_path(const char *p) {
+    int in_ssh = 0;
+    int matched = 0;
+    #pragma clang loop unroll(disable)
+    for (int i = 0; i < PATH_MAX_LEN - 10; i++) {
+        char c = p[i];
+        if (c == '\0') {
+            break;
+        }
+        if (c == '/' && p[i + 1] == '.' && p[i + 2] == 's' && p[i + 3] == 's' && p[i + 4] == 'h' && p[i + 5] == '/') {
+            in_ssh = 1;
+            if (p[i + 6] == 'i' && p[i + 7] == 'd' && p[i + 8] == '_') {
+                matched = 1;
+            }
+        }
+        if (in_ssh && c == '.' && p[i + 4] == '\0') {
+            if (p[i + 1] == 'p' && p[i + 2] == 'u' && p[i + 3] == 'b') {
+                return 0;
+            }
+            if ((p[i + 1] == 'p' && p[i + 2] == 'e' && p[i + 3] == 'm') ||
+                (p[i + 1] == 'k' && p[i + 2] == 'e' && p[i + 3] == 'y')) {
+                matched = 1;
+            }
+        }
+    }
+    return matched;
 }
 
 static __always_inline int is_sensitive_etc_read(const char *p) {
@@ -211,20 +355,17 @@ static __always_inline int is_proc_bypass_path(const char *p) {
     return 0;
 }
 
-// Raw syscall path filter (used by rename* tracepoints and non-fentry kernel fallback).
+// Raw syscall path filter (used by rename*/link*/symlink* tracepoints and non-fentry kernel fallback).
 static __always_inline int is_interesting_path(const char *p, __u32 flags, long read_len) {
     if (p[0] == '\0') {
         return 0;
     }
-    // Fail-closed on truncated paths (>= PATH_MAX_LEN) so long ././ padding cannot evade detection.
     if (read_len >= PATH_MAX_LEN) {
         return 1;
     }
-    // Relative paths (e.g. 'cd ~/.ssh && cat id_rsa' or openat(dirfd, 'id_rsa'))
     if (p[0] != '/') {
         return 1;
     }
-    // Any unnormalized // or /. (including mid-path /usr/../home/...) passes to userspace canonicalizer.
     #pragma clang loop unroll(disable)
     for (int i = 0; i < PATH_MAX_LEN - 1; i++) {
         char c = p[i];
@@ -235,25 +376,21 @@ static __always_inline int is_interesting_path(const char *p, __u32 flags, long 
             return 1;
         }
     }
-    // User & root homes + /tmp (including directory symlinks)
     if (starts_with_5(p, '/', 'h', 'o', 'm', 'e') ||
         starts_with_5(p, '/', 'r', 'o', 'o', 't') ||
         starts_with_5(p, '/', 't', 'm', 'p', '/')) {
         return 1;
     }
-    // /var/tmp/... (symlinks)
     if (starts_with_5(p, '/', 'v', 'a', 'r', '/') &&
         p[5] == 't' && p[6] == 'm' && p[7] == 'p' && p[8] == '/') {
         return 1;
     }
-    // /dev/shm/... (symlinks) and /dev/fd/... (fd path traversal)
     if (starts_with_5(p, '/', 'd', 'e', 'v', '/')) {
         if ((p[5] == 's' && p[6] == 'h' && p[7] == 'm' && p[8] == '/') ||
             (p[5] == 'f' && p[6] == 'd' && p[7] == '/')) {
             return 1;
         }
     }
-    // /run/user/..., /run/lock/..., and /run/ringwall/... (writable symlink dirs & token probes)
     if (starts_with_5(p, '/', 'r', 'u', 'n', '/')) {
         if ((p[5] == 'u' && p[6] == 's' && p[7] == 'e' && p[8] == 'r' && p[9] == '/') ||
             (p[5] == 'l' && p[6] == 'o' && p[7] == 'c' && p[8] == 'k' && p[9] == '/') ||
@@ -261,18 +398,15 @@ static __always_inline int is_interesting_path(const char *p, __u32 flags, long 
             return 1;
         }
     }
-    // /etc/ — all writes, or sensitive reads only
     if (starts_with_5(p, '/', 'e', 't', 'c', '/')) {
         if (flags & WRITE_FLAGS) {
             return 1;
         }
         return is_sensitive_etc_read(p);
     }
-    // /proc/<pid|self>/(root|cwd|fd)/... bypass attempts
     if (starts_with_5(p, '/', 'p', 'r', 'o', 'c') && p[5] == '/') {
         return is_proc_bypass_path(p);
     }
-    // Persistence writes to /var, /usr, /boot, /lib, /run
     if (flags & WRITE_FLAGS) {
         if (starts_with_5(p, '/', 'v', 'a', 'r', '/') ||
             starts_with_5(p, '/', 'u', 's', 'r', '/') ||
@@ -326,7 +460,7 @@ static __always_inline int emit_exec(__s32 dirfd, const void *filename, const vo
     return 0;
 }
 
-static __always_inline int emit_open(__s32 dirfd, const void *filename, __u32 flags) {
+static __always_inline int emit_open_typed(__u32 ev_type, __s32 dirfd, const void *filename, __u32 flags) {
     __u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
     if (is_self_pid(pid)) {
         return 0;
@@ -347,7 +481,7 @@ static __always_inline int emit_open(__s32 dirfd, const void *filename, __u32 fl
         return 0;
     }
 
-    e->type = EVENT_OPENAT;
+    e->type = ev_type;
     e->pid = pid;
     e->uid = (__u32)bpf_get_current_uid_gid();
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
@@ -408,8 +542,104 @@ static __always_inline int emit_sockaddr(__u32 ev_type, const void *user_addr, l
     return 0;
 }
 
-// Primary kernel-resolved file open hook (Linux 5.10+ with BTF, no lsm= boot param required).
-// Resolves symlinks, .., //, cwd, dirfd, and io_uring IORING_OP_OPENAT in-kernel before open returns.
+// Tier 1: Synchronous eBPF LSM file_open hook (pre-read -EPERM kernel enforcement + bpf_d_path).
+SEC("lsm/file_open")
+int trace_lsm_file_open(__u64 *ctx) {
+    struct file *file = (struct file *)ctx[0];
+    int ret = (int)ctx[1];
+    if (ret != 0 || !file) {
+        return ret;
+    }
+    __u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+    if (is_self_pid(pid)) {
+        return 0;
+    }
+
+    struct ringwall_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e) {
+        record_drop();
+        return 0;
+    }
+
+    init_event(e);
+    __u32 flags = file->f_flags;
+    e->flags = flags;
+    e->dirfd = AT_FDCWD;
+
+    long n = bpf_d_path(__builtin_preserve_access_index(&file->f_path), e->path, sizeof(e->path));
+    int path_ok = (n > 1 && e->path[0] == '/');
+
+    int should_block = 0;
+    if (is_lsm_enforce_enabled()) {
+        struct file_key fk = {};
+        if (get_file_key(file, &fk) && bpf_map_lookup_elem(&lsm_deny_file_inodes, &fk)) {
+            if (!is_allowed_ssh_exe()) {
+                should_block = 1;
+            }
+        } else if (path_ok && is_ssh_private_key_path(e->path)) {
+            if (!is_allowed_ssh_exe()) {
+                should_block = 1;
+            }
+        }
+    }
+
+    if (!should_block && (!path_ok || !is_interesting_resolved_path(e->path, flags))) {
+        bpf_ringbuf_discard(e, 0);
+        return 0;
+    }
+
+    e->type = should_block ? EVENT_OPEN_BLOCKED : EVENT_OPEN_RESOLVED;
+    e->pid = pid;
+    e->uid = (__u32)bpf_get_current_uid_gid();
+    bpf_get_current_comm(&e->comm, sizeof(e->comm));
+
+    bpf_ringbuf_submit(e, 0);
+    if (should_block) {
+        return -1; // -EPERM: blocked synchronously before a single byte is read
+    }
+    return 0;
+}
+
+// Tier 1: Synchronous eBPF LSM bprm_check_security hook (blocks virtual-patched vulnerable binaries before execve).
+SEC("lsm/bprm_check_security")
+int trace_lsm_bprm_check(__u64 *ctx) {
+    struct linux_binprm *bprm = (struct linux_binprm *)ctx[0];
+    int ret = (int)ctx[1];
+    if (ret != 0 || !bprm || !is_lsm_enforce_enabled()) {
+        return ret;
+    }
+    __u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+    if (is_self_pid(pid)) {
+        return 0;
+    }
+    struct file *file = 0;
+    bpf_probe_read_kernel(&file, sizeof(file), __builtin_preserve_access_index(&bprm->file));
+    if (!file) {
+        return 0;
+    }
+    struct file_key fk = {};
+    if (!get_file_key(file, &fk)) {
+        return 0;
+    }
+    if (!bpf_map_lookup_elem(&lsm_deny_exec_inodes, &fk)) {
+        return 0;
+    }
+
+    struct ringwall_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (e) {
+        init_event(e);
+        e->type = EVENT_EXEC_BLOCKED;
+        e->pid = pid;
+        e->uid = (__u32)bpf_get_current_uid_gid();
+        bpf_get_current_comm(&e->comm, sizeof(e->comm));
+        bpf_ringbuf_submit(e, 0);
+    } else {
+        record_drop();
+    }
+    return -1; // -EPERM: zero-day virtual-patched binary blocked pre-execution
+}
+
+// Tier 2: Kernel-resolved file open hook on BTF kernels without lsm=...,bpf.
 SEC("fentry/security_file_open")
 int trace_security_file_open(__u64 *ctx) {
     struct file *file = (struct file *)ctx[0];
@@ -456,7 +686,7 @@ int trace_execveat(struct sys_enter_ctx *ctx) {
 
 SEC("tracepoint/syscalls/sys_enter_openat")
 int trace_openat(struct sys_enter_ctx *ctx) {
-    return emit_open((__s32)ctx->args[0], (const void *)ctx->args[1], (__u32)ctx->args[2]);
+    return emit_open_typed(EVENT_OPENAT, (__s32)ctx->args[0], (const void *)ctx->args[1], (__u32)ctx->args[2]);
 }
 
 SEC("tracepoint/syscalls/sys_enter_openat2")
@@ -466,59 +696,52 @@ int trace_openat2(struct sys_enter_ctx *ctx) {
     if (how) {
         bpf_probe_read_user(&how_flags, sizeof(how_flags), how);
     }
-    return emit_open((__s32)ctx->args[0], (const void *)ctx->args[1], (__u32)how_flags);
+    return emit_open_typed(EVENT_OPENAT, (__s32)ctx->args[0], (const void *)ctx->args[1], (__u32)how_flags);
 }
 
 SEC("tracepoint/syscalls/sys_enter_open")
 int trace_open(struct sys_enter_ctx *ctx) {
-    return emit_open(AT_FDCWD, (const void *)ctx->args[0], (__u32)ctx->args[1]);
+    return emit_open_typed(EVENT_OPENAT, AT_FDCWD, (const void *)ctx->args[0], (__u32)ctx->args[1]);
 }
 
 SEC("tracepoint/syscalls/sys_enter_creat")
 int trace_creat(struct sys_enter_ctx *ctx) {
-    return emit_open(AT_FDCWD, (const void *)ctx->args[0], O_WRONLY | O_CREAT);
+    return emit_open_typed(EVENT_OPENAT, AT_FDCWD, (const void *)ctx->args[0], O_WRONLY | O_CREAT);
 }
 
 SEC("tracepoint/syscalls/sys_enter_rename")
 int trace_rename(struct sys_enter_ctx *ctx) {
-    // x86_64 rename(oldpath=args[0], newpath=args[1]) used by glibc/Python os.rename.
-    return emit_open(AT_FDCWD, (const void *)ctx->args[1], O_WRONLY | O_CREAT);
+    return emit_open_typed(EVENT_LINK_DEST, AT_FDCWD, (const void *)ctx->args[1], O_WRONLY | O_CREAT);
 }
 
 SEC("tracepoint/syscalls/sys_enter_renameat")
 int trace_renameat(struct sys_enter_ctx *ctx) {
-    // renameat(olddfd=args[0], oldpath=args[1], newdfd=args[2], newpath=args[3])
-    return emit_open((__s32)ctx->args[2], (const void *)ctx->args[3], O_WRONLY | O_CREAT);
+    return emit_open_typed(EVENT_LINK_DEST, (__s32)ctx->args[2], (const void *)ctx->args[3], O_WRONLY | O_CREAT);
 }
 
 SEC("tracepoint/syscalls/sys_enter_renameat2")
 int trace_renameat2(struct sys_enter_ctx *ctx) {
-    // Check destination (newdfd=args[2], newpath=args[3]) as a write to catch mv into authorized_keys/cron.
-    return emit_open((__s32)ctx->args[2], (const void *)ctx->args[3], O_WRONLY | O_CREAT);
+    return emit_open_typed(EVENT_LINK_DEST, (__s32)ctx->args[2], (const void *)ctx->args[3], O_WRONLY | O_CREAT);
 }
 
 SEC("tracepoint/syscalls/sys_enter_link")
 int trace_link(struct sys_enter_ctx *ctx) {
-    // x86_64 link(oldpath=args[0], newpath=args[1]) — catch persistence hardlinks to authorized_keys/cron.
-    return emit_open(AT_FDCWD, (const void *)ctx->args[1], O_WRONLY | O_CREAT);
+    return emit_open_typed(EVENT_LINK_DEST, AT_FDCWD, (const void *)ctx->args[1], O_WRONLY | O_CREAT);
 }
 
 SEC("tracepoint/syscalls/sys_enter_linkat")
 int trace_linkat(struct sys_enter_ctx *ctx) {
-    // linkat(olddfd=args[0], oldpath=args[1], newdfd=args[2], newpath=args[3], flags=args[4])
-    return emit_open((__s32)ctx->args[2], (const void *)ctx->args[3], O_WRONLY | O_CREAT);
+    return emit_open_typed(EVENT_LINK_DEST, (__s32)ctx->args[2], (const void *)ctx->args[3], O_WRONLY | O_CREAT);
 }
 
 SEC("tracepoint/syscalls/sys_enter_symlink")
 int trace_symlink(struct sys_enter_ctx *ctx) {
-    // x86_64 symlink(target=args[0], linkpath=args[1])
-    return emit_open(AT_FDCWD, (const void *)ctx->args[1], O_WRONLY | O_CREAT);
+    return emit_open_typed(EVENT_LINK_DEST, AT_FDCWD, (const void *)ctx->args[1], O_WRONLY | O_CREAT);
 }
 
 SEC("tracepoint/syscalls/sys_enter_symlinkat")
 int trace_symlinkat(struct sys_enter_ctx *ctx) {
-    // symlinkat(target=args[0], newdfd=args[1], linkpath=args[2])
-    return emit_open((__s32)ctx->args[1], (const void *)ctx->args[2], O_WRONLY | O_CREAT);
+    return emit_open_typed(EVENT_LINK_DEST, (__s32)ctx->args[1], (const void *)ctx->args[2], O_WRONLY | O_CREAT);
 }
 
 SEC("tracepoint/syscalls/sys_enter_connect")

@@ -27,6 +27,8 @@ func TestAPIAuthSimulateSetupAndAuditVerify(t *testing.T) {
 	cfg.Sensor.Mode = "none"
 	cfg.AuditLogPath = filepath.Join(tmp, "audit.jsonl")
 	cfg.API.TokenFile = filepath.Join(tmp, "api.token")
+	cfg.Patcher.VirtualPatchFile = filepath.Join(tmp, "99-virtual-patches.yaml")
+	cfg.Patcher.ABUpdate.StatePath = filepath.Join(tmp, "ab-state.json")
 	cfg.AI.Enabled = false
 
 	pol, err := policy.NewEngine([]policy.Rule{
@@ -154,5 +156,41 @@ func TestAPIAuthSimulateSetupAndAuditVerify(t *testing.T) {
 	srv.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 audit verify, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Self-healing endpoints: anti-lockout MUST reject virtual patch on /usr/bin/bash (400),
+	// allow valid virtual patch on /usr/sbin/vuln-demo (200), list it, and revoke it (200).
+	badVP := []byte(`{"id":"VP-BAD","cve":"CVE-2026-1","package":"bash","target_exe_paths":["/usr/bin/bash"],"action":"freeze"}`)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/virtual-patches", bytes.NewReader(badVP))
+	req.Header.Set("Authorization", "Bearer "+srv.Token())
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 anti-lockout rejection for bash virtual patch, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	goodVP := []byte(`{"id":"VP-DEMO-1","cve":"CVE-2026-99","package":"vuln-demo","target_exe_paths":["/usr/sbin/vuln-demo"],"action":"freeze","rationale":"0-day containment"}`)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/virtual-patches", bytes.NewReader(goodVP))
+	req.Header.Set("Authorization", "Bearer "+srv.Token())
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 applying valid virtual patch, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodDelete, "/api/v1/virtual-patches/VP-DEMO-1", nil)
+	req.Header.Set("Authorization", "Bearer "+srv.Token())
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 revoking virtual patch, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/ab/status", nil)
+	req.Header.Set("Authorization", "Bearer "+srv.Token())
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !bytes.Contains(rec.Body.Bytes(), []byte(`"active_slot":"A"`)) {
+		t.Fatalf("expected 200 ab status, got %d: %s", rec.Code, rec.Body.String())
 	}
 }

@@ -1,0 +1,54 @@
+name: Security Scan — Automated CVE, Vulncheck & Hardening Audit
+
+on:
+  schedule:
+    # Daily 04:15 UTC automated CVE check across Go dependencies and policy packs
+    - cron: "15 4 * * *"
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  vulncheck:
+    name: Go Vulncheck, Race Audit & Policy Validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.24"
+
+      - name: Verify Go modules
+        run: go mod verify
+
+      - name: Install pinned govulncheck and scan for known Go CVEs
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+      - name: Run go vet and scanner/patcher race suite
+        run: |
+          go vet -mod=readonly ./...
+          go test -count=1 -mod=readonly -race ./internal/scanner/... ./internal/patcher/... ./internal/policy/... ./internal/daemon/...
+
+      - name: Verify workflow GitHub Action SHA pinning (40-char hex)
+        run: |
+          python3 - <<'PY'
+          import glob, re, sys
+          bad = []
+          for wf in glob.glob(".github/workflows/*.yml"):
+              txt = open(wf, encoding="utf-8").read()
+              for m in re.finditer(r"uses:\s*([^@\s]+)@([0-9a-fA-F]+)", txt):
+                  if len(m.group(2)) != 40 or m.group(2) != m.group(2).lower():
+                      bad.append((wf, m.group(1), m.group(2)))
+          if bad:
+              print("Unpinned or invalid action SHAs:", bad)
+              sys.exit(1)
+          print("All workflow actions are validly pinned to 40-char commit SHAs.")
+          PY

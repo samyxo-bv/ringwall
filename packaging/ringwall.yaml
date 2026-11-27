@@ -14,9 +14,29 @@ policy_dirs:
 audit_log_path: /var/log/ringwall/audit.jsonl
 
 sensor:
-  mode: auto # auto (ebpf -> procfs fallback) | ebpf | procfs | none
+  mode: auto # auto (ebpf LSM/fentry -> procfs fallback) | ebpf | procfs | none
   bpf_object_path: /usr/lib/ringwall/ringwall.bpf.o
   poll_interval_ms: 250
+  enable_lsm_blocking: true # Synchronous -EPERM kernel blocking when booted with lsm=...,bpf (disabled automatically in audit mode)
+
+scanner:
+  enabled: true
+  interval_min: 60
+  allow_online_feeds: false # Set true to query HTTPS OSV.dev + CISA KEV live feeds; offline_db_path works airgapped
+  # offline_db_path: /etc/ringwall/advisories.json
+
+patcher:
+  mode: virtual_only # off | virtual_only | auto_critical | auto_all
+  dry_run: false
+  auto_fix_drift: true
+  restart_stale_services: true
+  ai_virtual_patch: true
+  virtual_patch_file: /etc/ringwall/policies.d/99-virtual-patches.yaml
+  ab_update:
+    enabled: false
+    state_path: /var/lib/ringwall/ab-state.json
+    boot_env_path: /var/lib/ringwall/ab-boot.env
+    # trusted_pubkey_ed25519_b64: ""
 
 enforcer:
   enable_signals: true
