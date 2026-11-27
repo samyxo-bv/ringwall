@@ -319,26 +319,34 @@ func matchesRule(r *Rule, ev model.Event) bool {
 // to detect recursive rm targeting critical system roots or a user's home root,
 // even without -f, with GNU abbreviations (--rec), --, -Rf, or /bin/rm.
 func IsDestructiveRM(ev model.Event) bool {
-	tokens := ev.Argv
-	if ev.Cmdline != "" {
-		cmdTokens := strings.Fields(ev.Cmdline)
-		if len(cmdTokens) > len(tokens) {
-			tokens = cmdTokens
+	checkSlice := func(tokens []string, exe string) bool {
+		if len(tokens) == 0 {
+			return false
 		}
-	}
-	if len(tokens) == 0 {
+		if checkRMTokens(tokens, exe) {
+			return true
+		}
+		for i := 0; i < len(tokens)-1; i++ {
+			if tokens[i] == "-c" || tokens[i] == "-lc" {
+				// Quoted single-arg shell command (preserved in eBPF argv).
+				if checkRMTokens(strings.Fields(tokens[i+1]), "") {
+					return true
+				}
+				// Space-split cmdline fallback.
+				if checkRMTokens(tokens[i+1:], "") {
+					return true
+				}
+			}
+		}
 		return false
 	}
 
-	if checkRMTokens(tokens, ev.Exe) {
+	if checkSlice(ev.Argv, ev.Exe) {
 		return true
 	}
-	for i := 0; i < len(tokens)-1; i++ {
-		if tokens[i] == "-c" || tokens[i] == "-lc" {
-			sub := strings.Fields(tokens[i+1])
-			if checkRMTokens(sub, "") {
-				return true
-			}
+	if ev.Cmdline != "" {
+		if checkSlice(strings.Fields(ev.Cmdline), ev.Exe) {
+			return true
 		}
 	}
 	return false

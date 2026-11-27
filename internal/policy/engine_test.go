@@ -112,6 +112,17 @@ func TestDestructiveRMAllBypassVariants(t *testing.T) {
 		t.Errorf("expected >8-arg rm to be caught via cmdline, got matches=%d act=%s", len(matches), act)
 	}
 
+	// Real eBPF + /proc/cmdline shape for `bash -c 'rm -r /usr 2>/dev/null || sleep 25'`.
+	bashRmEv := model.Event{
+		Type:    model.EventExec,
+		Exe:     "/usr/bin/bash",
+		Argv:    []string{"bash", "-c", "rm -r /usr 2>/dev/null || sleep 25"},
+		Cmdline: "bash -c rm -r /usr 2>/dev/null || sleep 25",
+	}
+	if matches, act, _ := eng.Evaluate(bashRmEv); len(matches) != 1 || act != model.ActionKill {
+		t.Errorf("expected bash -c rm -r /usr to be caught with kill, got matches=%d act=%s", len(matches), act)
+	}
+
 	// Normal safe cleanup MUST NOT false-positive.
 	safe := [][]string{
 		{"rm", "-rf", "/tmp/my-build-dir"},
