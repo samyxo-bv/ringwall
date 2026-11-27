@@ -1,0 +1,121 @@
+# Ringwall Core Host Hardening Policies
+# Note: Exclusions match ONLY exact canonical full executable paths (exclude_exe_paths),
+# never attacker-controllable comm (PR_SET_NAME) or basenames like /tmp/ssh.
+rules:
+  - id: RW-CORE-001
+    name: Interactive reverse shell pattern
+    category: core-hardening
+    severity: critical
+    action: kill
+    mitre: T1059.004
+    description: Detects shell/interpreter execve invocations spawning TCP/UDP reverse shells (/dev/tcp, nc -e, socat exec, python pty socket).
+    match:
+      event_types: [exec]
+      cmdline_regex:
+        - '/dev/(tcp|udp)/[0-9a-zA-Z\.\-]+/[0-9]+'
+        - '(^|\s)(nc|ncat|netcat)\s+.*(\s-e\s|\s-c\s|--sh-exec)'
+        - 'socat\s+.*exec:'
+        - 'python3?\s+-c\s+.*socket.*(subprocess|pty\.spawn)'
+
+  - id: RW-CORE-002
+    name: Pipe-to-shell remote code execution (shell wrapper)
+    category: core-hardening
+    severity: high
+    action: freeze
+    mitre: T1059.004
+    description: Detects shell -c commands piping curl or wget directly into sh or bash.
+    match:
+      event_types: [exec]
+      cmdline_regex:
+        - '(curl|wget)\s+.*\|\s*(sudo\s+)?(ba)?sh(\s|$)'
+
+  - id: RW-CORE-003
+    name: Sensitive password database access (/etc/shadow)
+    category: core-hardening
+    severity: critical
+    action: freeze
+    mitre: T1003.008
+    description: Flags non-authentication binaries reading /etc/shadow or /etc/gshadow.
+    match:
+      event_types: [open]
+      path_globs:
+        - '/etc/shadow'
+        - '/etc/gshadow'
+      exclude_exe_paths:
+        - '/usr/bin/login'
+        - '/bin/login'
+        - '/usr/bin/su'
+        - '/bin/su'
+        - '/usr/bin/sudo'
+        - '/usr/bin/passwd'
+        - '/usr/sbin/sshd'
+        - '/usr/lib/systemd/systemd'
+        - '/lib/systemd/systemd'
+        - '/usr/sbin/unix_chkpwd'
+        - '/sbin/unix_chkpwd'
+        - '/usr/bin/chage'
+        - '/usr/sbin/useradd'
+        - '/usr/sbin/usermod'
+
+  - id: RW-CORE-004
+    name: Persistence write to cron or systemd units
+    category: core-hardening
+    severity: critical
+    action: freeze
+    mitre: T1053.003
+    description: Detects writes to /etc/cron*, /var/spool/cron*, or /etc/systemd/system/*.
+    match:
+      event_types: [open]
+      require_write: true
+      path_globs:
+        - '/etc/crontab'
+        - '/etc/cron.d/*'
+        - '/etc/cron.*/*'
+        - '/var/spool/cron/**'
+        - '/etc/systemd/system/**'
+      exclude_exe_paths:
+        - '/usr/bin/dpkg'
+        - '/usr/bin/apt'
+        - '/usr/bin/apt-get'
+        - '/usr/lib/systemd/systemd'
+        - '/lib/systemd/systemd'
+        - '/usr/bin/systemctl'
+        - '/bin/systemctl'
+
+  - id: RW-CORE-005
+    name: SSH authorized_keys modification
+    category: core-hardening
+    severity: high
+    action: freeze
+    mitre: T1098.004
+    description: Detects writes to authorized_keys files that could establish persistent remote access.
+    match:
+      event_types: [open]
+      require_write: true
+      path_globs:
+        - '**/.ssh/authorized_keys'
+        - '**/.ssh/authorized_keys2'
+
+  - id: RW-CORE-006
+    name: Kernel module insertion attempt
+    category: core-hardening
+    severity: critical
+    action: freeze
+    mitre: T1547.006
+    description: Flags insmod or modprobe invocations outside systemd-udevd.
+    match:
+      event_types: [exec]
+      comm_in: [insmod, modprobe]
+      exclude_exe_paths:
+        - '/usr/lib/systemd/systemd-udevd'
+        - '/lib/systemd/systemd-udevd'
+
+  - id: RW-CORE-007
+    name: io_uring ring setup (syscall-bypass evasion)
+    category: core-hardening
+    severity: critical
+    action: freeze
+    mitre: T1055
+    description: Detects and freezes processes invoking io_uring_setup so async IORING_OP_* operations cannot bypass syscall tracepoints on kernels older than 6.6. Host operators running trusted io_uring workloads (e.g. databases) can add exact canonical paths under exclude_exe_paths.
+    match:
+      event_types: [io_uring]

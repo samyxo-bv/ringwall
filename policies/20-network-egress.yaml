@@ -1,0 +1,25 @@
+# Ringwall Network Egress Policies
+rules:
+  - id: RW-NET-001
+    name: Outbound connection to common C2 / reverse-shell port
+    category: network-egress
+    severity: critical
+    action: block_egress
+    mitre: T1571
+    description: Blocks public outbound connections to common listener/C2 ports (4444, 1337, 31337, 9001, 5555).
+    match:
+      event_types: [connect]
+      dst_ports: [4444, 1337, 31337, 9001, 5555]
+      dst_ip_not_private: true
+
+  - id: RW-NET-002
+    name: Shell or netcat initiating external connection
+    category: network-egress
+    severity: high
+    action: block_egress
+    mitre: T1071
+    description: Flags raw shells or netcat variants opening direct outbound sockets to public IPs.
+    match:
+      event_types: [connect]
+      comm_in: [sh, bash, dash, zsh, nc, ncat, netcat, socat]
+      dst_ip_not_private: true

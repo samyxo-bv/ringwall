@@ -1,0 +1,72 @@
+# Ringwall AI Coding & Autonomous Agent Guard Policies
+# Stops prompt-injected or runaway agents (Claude Code, Codex, Cursor, MCP tools, Python/Node scripts)
+# from reading host secrets, exfiltrating credentials, or executing destructive wipe loops.
+rules:
+  - id: RW-AGENT-001
+    name: Non-SSH binary accessing SSH private keys
+    category: ai-agent-guard
+    severity: critical
+    action: freeze
+    mitre: T1552.004
+    description: Detects scripts, AI agents, or unknown binaries opening SSH private keys (paths canonicalized across cwd, dirfd, /proc/self/root, and symlinks).
+    match:
+      event_types: [open]
+      path_globs:
+        - '**/.ssh/id_*'
+        - '**/.ssh/*.pem'
+        - '**/.ssh/*.key'
+      exclude_path_globs:
+        - '**/.ssh/*.pub'
+      exclude_exe_paths:
+        - '/usr/bin/ssh'
+        - '/usr/bin/ssh-agent'
+        - '/usr/bin/ssh-add'
+        - '/usr/bin/ssh-keygen'
+
+  - id: RW-AGENT-002
+    name: AI agent accessing cloud, Kubernetes, or GPG credentials
+    category: ai-agent-guard
+    severity: critical
+    action: freeze
+    mitre: T1552.001
+    description: Flags autonomous agent process trees reading AWS, GCP, Kubernetes, Docker, or GPG credential stores.
+    match:
+      event_types: [open]
+      path_globs:
+        - '**/.aws/credentials'
+        - '**/.kube/config'
+        - '**/.docker/config.json'
+        - '**/.gnupg/private-keys-v1.d/**'
+        - '**/.config/gcloud/credentials.db'
+      ancestor_any:
+        - claude
+        - codex
+        - cursor
+        - openclaw
+        - copilot
+        - aider
+        - mcp
+        - agent
+
+  - id: RW-AGENT-003
+    name: Destructive filesystem wipe (rm recursive + force on system/home root)
+    category: ai-agent-guard
+    severity: critical
+    action: kill
+    mitre: T1485
+    description: Tokenized argv matcher catching recursive-force rm targeting /, /etc, /usr, /var, /home, /root, or ~ regardless of flag ordering, -Rf, --, or /bin/rm.
+    match:
+      event_types: [exec]
+      destructive_rm: true
+
+  - id: RW-AGENT-004
+    name: Encoded payload execution (shell wrapper)
+    category: ai-agent-guard
+    severity: high
+    action: freeze
+    mitre: T1027
+    description: Flags shell -c commands executing base64-decoded payload pipelines.
+    match:
+      event_types: [exec]
+      cmdline_regex:
+        - 'base64\s+(-d|--decode).*\|.*(sh|bash|python|perl|ruby)'

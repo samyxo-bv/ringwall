@@ -1,0 +1,59 @@
+# Ringwall configuration
+# Tip: Run 'sudo ringwallctl setup' or open the Setup Wizard at http://127.0.0.1:9443
+# for a step-by-step guided configuration with live refusal testing!
+#
+# Deterministic kernel/policy enforcement runs FIRST (0 ms).
+# Local/uncensored AI Guardian runs SECOND for explanation, escalation, and multi-model consensus.
+# Security invariant: AI can NEVER downgrade a deterministic freeze/kill/block verdict.
+
+mode: interactive # audit | interactive | strict
+
+policy_dirs:
+  - /etc/ringwall/policies.d
+
+audit_log_path: /var/log/ringwall/audit.jsonl
+
+sensor:
+  mode: auto # auto (ebpf -> procfs fallback) | ebpf | procfs | none
+  bpf_object_path: /usr/lib/ringwall/ringwall.bpf.o
+  poll_interval_ms: 250
+
+enforcer:
+  enable_signals: true
+  enable_nftables: false # Set true after loading packaging/nftables.conf (enabled automatically in the Ringwall ISO)
+  nft_table: inet ringwall
+  dry_run: false
+
+ai:
+  enabled: true
+  # Strategies:
+  # - tiered:    Tier 1 fast local abliterated model first; Tier 2 runs only on risk >= escalate_threshold,
+  #              prompt-injection flags, or Tier 1 refusal/error (low VRAM/CPU overhead).
+  # - consensus: Runs all configured models in parallel and merges FAIL-CLOSED (strictest verdict wins).
+  # - failover:  Tries models in order until one returns valid non-refusal JSON.
+  strategy: tiered
+  escalate_threshold: 55
+  allow_remote_endpoint: false
+  models:
+    - name: tier1-local-abliterated
+      provider: ollama
+      endpoint: http://127.0.0.1:11434
+      model: huihui_ai/qwen2.5-coder-abliterated:7b
+      tier: 1
+      abliterated: true
+      timeout_sec: 15
+    # Optional Tier 2 (uncomment or configure via 'ringwallctl setup' / Web Wizard):
+    # - name: tier2-venice-uncensored
+    #   provider: venice
+    #   endpoint: https://api.venice.ai/api/v1
+    #   model: venice-uncensored-1-2
+    #   tier: 2
+    #   abliterated: true
+    #   allow_remote_endpoint: true
+    #   api_key_file: /etc/ringwall/keys/tier2-venice-uncensored.key
+    #   timeout_sec: 20
+
+api:
+  listen_addr: 127.0.0.1:9443
+  token_file: /run/ringwall/api.token
+  allow_non_loopback: false

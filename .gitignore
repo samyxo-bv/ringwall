@@ -1,0 +1,19 @@
+# Binaries & build outputs
+/bin/
+/dist/
+*.iso
+*.sha256
+internal/sensor/ringwall.bpf.o
+
+# Runtime & test state
+*.log
+*.jsonl
+*.pid
+*.sock
+coverage.out
+
+# IDE / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
