@@ -5,6 +5,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -19,7 +21,9 @@ import (
 	"github.com/samyxo-bv/ringwall/internal/config"
 	"github.com/samyxo-bv/ringwall/internal/guardian"
 	"github.com/samyxo-bv/ringwall/internal/model"
+	"github.com/samyxo-bv/ringwall/internal/patcher"
 	"github.com/samyxo-bv/ringwall/internal/policy"
+	"github.com/samyxo-bv/ringwall/internal/scanner"
 	"github.com/samyxo-bv/ringwall/internal/setup"
 )
 
@@ -76,6 +80,15 @@ func main() {
 		}
 		fmt.Printf("OK: %d policy rules valid in %s\n", eng.Count(), dir)
 		return
+	case "ab-keygen":
+		runABKeygen(args[1:])
+		return
+	case "ab-sign":
+		runABSign(args[1:])
+		return
+	case "ab-verify":
+		runABVerify(args[1:])
+		return
 	}
 
 	token, err := readToken(*tokenFile)
@@ -98,12 +111,87 @@ func main() {
 		_ = json.Unmarshal(body, &st)
 		fmt.Printf("Ringwall %s\n", st.Version)
 		fmt.Printf("  Mode:       %s\n", st.Mode)
-		fmt.Printf("  Sensor:     %s\n", st.SensorMode)
-		fmt.Printf("  Policies:   %d\n", st.PolicyCount)
+		fmt.Printf("  Sensor:     %s (open_hook=%s lsm_blocking=%v)\n", st.SensorMode, st.OpenHook, st.LSMEnforceActive)
+		fmt.Printf("  Policies:   %d (virtual_patches=%d)\n", st.PolicyCount, st.ActiveVirtualPatches)
+		fmt.Printf("  Self-Heal:  scanner=%v patcher=%s last_findings=%d (kev=%d)\n", st.ScannerEnabled, st.PatcherMode, st.LastScanFindings, st.LastScanKEV)
 		fmt.Printf("  Events:     %d (dropped: %d)\n", st.EventsTotal, st.DroppedEvents)
 		fmt.Printf("  Incidents:  %d (frozen: %d)\n", st.IncidentsTotal, st.FrozenCount)
 		fmt.Printf("  AI Pool:    enabled=%v strategy=%s models=%v\n", st.AIEnabled, st.AIStrategy, st.AIModels)
 		fmt.Printf("  Audit Log:  %s\n", st.AuditLogPath)
+
+	case "scan":
+		body := mustReq(client, http.MethodPost, base+"/api/v1/scan", token, nil)
+		if *jsonOut {
+			fmt.Println(string(body))
+			return
+		}
+		var rep scanner.ScanReport
+		_ = json.Unmarshal(body, &rep)
+		fmt.Printf("Scan complete (%d ms): ecosystem=%s packages=%d findings=%d (kev=%d immediate=%d 0day_virtual=%d) drift=%d stale_procs=%d\n",
+			rep.DurationMS, rep.Ecosystem, rep.PackageCount, len(rep.Findings), rep.KEVCount, rep.ImmediateCount, rep.VirtualCount, len(rep.Drift), len(rep.StaleProcesses))
+		for _, f := range rep.Findings {
+			kevTag := ""
+			if f.InKEV {
+				kevTag = " [CISA-KEV]"
+			}
+			fix := f.FixedVersion
+			if fix == "" {
+				fix = "NO-UPSTREAM-FIX"
+			}
+			fmt.Printf("  %-15s %-8s %-18s %s %s -> %s [%s]%s\n", f.Lane, f.Severity, f.CVE, f.Package, f.InstalledVersion, fix, f.SourceFeed, kevTag)
+		}
+		for _, d := range rep.Drift {
+			fmt.Printf("  DRIFT %-12s %-8s %s actual=%s expected=%s\n", d.ID, d.Severity, d.Target, d.Actual, d.Expected)
+		}
+
+	case "patch":
+		dryRun := len(args) > 1 && (args[1] == "--dry-run" || args[1] == "dry-run")
+		payload, _ := json.Marshal(map[string]any{"dry_run": dryRun})
+		body := mustReq(client, http.MethodPost, base+"/api/v1/patch", token, payload)
+		if *jsonOut {
+			fmt.Println(string(body))
+			return
+		}
+		var s patcher.ApplySummary
+		_ = json.Unmarshal(body, &s)
+		fmt.Printf("Patch cycle (mode=%s dry_run=%v): pkgs=%d restarts=%d drift_fixes=%d vpatches_applied=%d vpatches_revoked=%d\n",
+			s.Mode, s.DryRun, len(s.PackageResults), len(s.ServiceRestarts), len(s.DriftFixes), len(s.VirtualPatchesApplied), len(s.VirtualPatchesRevoked))
+
+	case "vpatches":
+		body := mustReq(client, http.MethodGet, base+"/api/v1/virtual-patches", token, nil)
+		if *jsonOut {
+			fmt.Println(string(body))
+			return
+		}
+		var list []patcher.VirtualPatch
+		_ = json.Unmarshal(body, &list)
+		if len(list) == 0 {
+			fmt.Println("No active virtual patches.")
+			return
+		}
+		for _, vp := range list {
+			fmt.Printf("  %-22s cve=%-16s pkg=%-14s action=%-8s lsm=%v expires=%s\n",
+				vp.ID, vp.CVE, vp.Package, vp.Action, vp.KernelLSMActive, vp.ExpiresAt.Format(time.RFC3339))
+		}
+
+	case "vpatch-revoke":
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "usage: ringwallctl vpatch-revoke <virtual-patch-id>")
+			os.Exit(1)
+		}
+		body := mustReq(client, http.MethodDelete, base+"/api/v1/virtual-patches/"+args[1], token, nil)
+		fmt.Println(string(body))
+
+	case "ab-status":
+		body := mustReq(client, http.MethodGet, base+"/api/v1/ab/status", token, nil)
+		if *jsonOut {
+			fmt.Println(string(body))
+			return
+		}
+		var st patcher.ABSlotState
+		_ = json.Unmarshal(body, &st)
+		fmt.Printf("A/B Slot Status: active=%s version=%s lkg=%s pending=%s tries=%d healthy=%v\n",
+			st.ActiveSlot, st.CurrentVersion, st.LastKnownGoodSlot, st.PendingSlot, st.TriesRemaining, st.HealthConfirmed)
 
 	case "incidents":
 		body := mustReq(client, http.MethodGet, base+"/api/v1/incidents", token, nil)
@@ -362,6 +450,104 @@ func printCheckResult(res guardian.ModelCheckResult) {
 	fmt.Printf("  Advice:  %s\n", res.Advice)
 }
 
+func runABKeygen(args []string) {
+	prefix := "ringwall-ab"
+	if len(args) > 0 && args[0] != "" {
+		prefix = args[0]
+	}
+	pub, priv, err := patcher.GenerateABKeypair()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ab-keygen failed: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.WriteFile(prefix+".pub", []byte(pub+"\n"), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "write pubkey: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.WriteFile(prefix+".priv", []byte(priv+"\n"), 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "write privkey: %v\n", err)
+		os.Exit(1)
+	}
+	_ = os.Chmod(prefix+".priv", 0o600)
+	fmt.Printf("Generated Ed25519 A/B signing keypair: %s.pub (0644), %s.priv (0600)\n", prefix, prefix)
+}
+
+func runABSign(args []string) {
+	if len(args) < 4 {
+		fmt.Fprintln(os.Stderr, "usage: ringwallctl ab-sign <privkey-file> <version> <release-url> <image-file> [out-manifest.json]")
+		os.Exit(1)
+	}
+	privBytes, err := os.ReadFile(args[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "read privkey: %v\n", err)
+		os.Exit(1)
+	}
+	f, err := os.Open(args[3])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "open image: %v\n", err)
+		os.Exit(1)
+	}
+	h := sha256.New()
+	sz, err := io.Copy(h, f)
+	f.Close()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "hash image: %v\n", err)
+		os.Exit(1)
+	}
+	m := patcher.ABManifest{
+		Version:     args[1],
+		ReleaseURL:  args[2],
+		ImageSHA256: hex.EncodeToString(h.Sum(nil)),
+		ImageSize:   sz,
+		PublishedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	if err := patcher.SignManifest(string(privBytes), &m); err != nil {
+		fmt.Fprintf(os.Stderr, "sign manifest: %v\n", err)
+		os.Exit(1)
+	}
+	b, _ := json.MarshalIndent(m, "", "  ")
+	if len(args) >= 5 && args[4] != "" {
+		if err := os.WriteFile(args[4], append(b, '\n'), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "write manifest: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Signed A/B manifest written to %s (sha256=%s size=%d)\n", args[4], m.ImageSHA256, m.ImageSize)
+		return
+	}
+	fmt.Println(string(b))
+}
+
+func runABVerify(args []string) {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: ringwallctl ab-verify <pubkey-file> <manifest.json> [current-version]")
+		os.Exit(1)
+	}
+	pubBytes, err := os.ReadFile(args[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "read pubkey: %v\n", err)
+		os.Exit(1)
+	}
+	mBytes, err := os.ReadFile(args[1])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "read manifest: %v\n", err)
+		os.Exit(1)
+	}
+	var m patcher.ABManifest
+	if err := json.Unmarshal(mBytes, &m); err != nil {
+		fmt.Fprintf(os.Stderr, "parse manifest: %v\n", err)
+		os.Exit(1)
+	}
+	curVer := ""
+	if len(args) >= 3 {
+		curVer = args[2]
+	}
+	if err := patcher.VerifyManifest(string(pubBytes), curVer, m); err != nil {
+		fmt.Fprintf(os.Stderr, "INVALID manifest: %v\n", err)
+		os.Exit(2)
+	}
+	fmt.Printf("VALID Ed25519 A/B manifest: version=%s sha256=%s size=%d\n", m.Version, m.ImageSHA256, m.ImageSize)
+}
+
 func usage() {
 	fmt.Println(`Usage: ringwallctl [flags] <command> [args]
 
@@ -369,7 +555,15 @@ Commands:
   setup                     Interactive beginner-friendly Setup Wizard (local or cloud uncensored AI)
   providers                 Compare local & cloud uncensored/abliterated AI providers
   test-ai                   Run live 4-point API + security refusal test on configured models
-  status                    Show daemon, sensor, policy, and AI Guardian status
+  status                    Show daemon, eBPF LSM sensor, policy, scanner, and AI Guardian status
+  scan                      Run live CVE, CISA KEV, stale-library, and kernel drift scan
+  patch [--dry-run]         Run self-healing patch cycle (security upgrades, drift fixes, 0-day virtual patches)
+  vpatches                  List active TTL-bounded zero-day virtual patches
+  vpatch-revoke <id>        Revoke an active virtual patch
+  ab-status                 Show immutable A/B slot state and boot-health status
+  ab-keygen [prefix]        Generate Ed25519 signing keypair for immutable A/B releases
+  ab-sign <priv> <ver> <url> <file> [out]   Create Ed25519-signed A/B release manifest
+  ab-verify <pub> <manifest> [cur-ver]      Verify Ed25519 signature & anti-downgrade on A/B manifest
   incidents                 List recorded security incidents
   simulate                  Run 5 safe built-in attack simulations
   approve <incident-id>     Resume process and add scoped exception

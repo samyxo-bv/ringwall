@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -36,6 +37,7 @@ type Rule struct {
 type MatchSpec struct {
 	EventTypes       []model.EventType `yaml:"event_types,omitempty"`
 	CommIn           []string          `yaml:"comm_in,omitempty"`
+	ExePaths         []string          `yaml:"exe_paths,omitempty"`
 	ExcludeExePaths  []string          `yaml:"exclude_exe_paths,omitempty"`
 	PathGlobs        []string          `yaml:"path_globs,omitempty"`
 	ExcludePathGlobs []string          `yaml:"exclude_path_globs,omitempty"`
@@ -53,10 +55,25 @@ type allowEntry struct {
 	path   string
 }
 
+type virtualRuleEntry struct {
+	rule      Rule
+	expiresAt time.Time
+}
+
 type Engine struct {
 	mu           sync.RWMutex
 	rules        []Rule
+	virtualRules map[string]virtualRuleEntry
 	runtimeAllow []allowEntry
+	vpExeGuard   func(pid int, exe string) bool
+}
+
+// SetVirtualPatchExeGuard installs a runtime anti-lockout guard so virtual-patch rules can NEVER
+// match, freeze, or kill protected system binaries (sshd, systemd, shells, apt, ringwalld, etc.).
+func (e *Engine) SetVirtualPatchExeGuard(fn func(pid int, exe string) bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.vpExeGuard = fn
 }
 
 func NewEngine(rules []Rule) (*Engine, error) {
@@ -81,7 +98,10 @@ func NewEngine(rules []Rule) (*Engine, error) {
 		}
 		compiled = append(compiled, r)
 	}
-	return &Engine{rules: compiled}, nil
+	return &Engine{
+		rules:        compiled,
+		virtualRules: make(map[string]virtualRuleEntry),
+	}, nil
 }
 
 func LoadDirs(dirs []string) (*Engine, error) {
@@ -124,7 +144,84 @@ func LoadDirs(dirs []string) (*Engine, error) {
 func (e *Engine) Count() int {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	return len(e.rules)
+	now := time.Now().UTC()
+	activeVirt := 0
+	for _, v := range e.virtualRules {
+		if v.expiresAt.IsZero() || now.Before(v.expiresAt) {
+			activeVirt++
+		}
+	}
+	return len(e.rules) + activeVirt
+}
+
+// UpsertVirtualRule installs or updates a temporary TTL-bounded virtual-patch containment rule at runtime.
+func (e *Engine) UpsertVirtualRule(r Rule, expiresAt time.Time) error {
+	if r.ID == "" || r.Name == "" {
+		return fmt.Errorf("virtual rule missing id or name")
+	}
+	if r.Action == "" {
+		r.Action = model.ActionFreeze
+	}
+	if r.Severity == "" {
+		r.Severity = model.SeverityHigh
+	}
+	r.compiledCmdRegex = nil
+	for _, expr := range r.Match.CmdlineRegex {
+		re, err := regexp.Compile(expr)
+		if err != nil {
+			return fmt.Errorf("virtual rule %s invalid cmdline_regex %q: %w", r.ID, expr, err)
+		}
+		r.compiledCmdRegex = append(r.compiledCmdRegex, re)
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.virtualRules == nil {
+		e.virtualRules = make(map[string]virtualRuleEntry)
+	}
+	e.virtualRules[r.ID] = virtualRuleEntry{rule: r, expiresAt: expiresAt.UTC()}
+	return nil
+}
+
+// RemoveVirtualRule deletes an active virtual-patch rule (e.g. once upstream CVE is patched).
+func (e *Engine) RemoveVirtualRule(id string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if _, ok := e.virtualRules[id]; !ok {
+		return false
+	}
+	delete(e.virtualRules, id)
+	return true
+}
+
+// PruneExpiredVirtualRules removes all virtual rules whose TTL has elapsed and returns their IDs.
+func (e *Engine) PruneExpiredVirtualRules(now time.Time) []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var pruned []string
+	for id, entry := range e.virtualRules {
+		if !entry.expiresAt.IsZero() && !now.Before(entry.expiresAt) {
+			delete(e.virtualRules, id)
+			pruned = append(pruned, id)
+		}
+	}
+	sort.Strings(pruned)
+	return pruned
+}
+
+// VirtualRules returns a sorted snapshot of all non-expired virtual-patch rules.
+func (e *Engine) VirtualRules() []Rule {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	now := time.Now().UTC()
+	out := make([]Rule, 0, len(e.virtualRules))
+	for _, entry := range e.virtualRules {
+		if !entry.expiresAt.IsZero() && !now.Before(entry.expiresAt) {
+			continue
+		}
+		out = append(out, entry.rule)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
 }
 
 // AddRuntimeAllow adds a strictly scoped exception bound to full canonical exe path + target path.
@@ -166,19 +263,18 @@ func (e *Engine) Evaluate(ev model.Event) ([]model.PolicyMatch, model.Action, mo
 	}
 
 	e.mu.RLock()
-	defer e.mu.RUnlock()
 
 	var matches []model.PolicyMatch
 	action := model.ActionAllow
 	severity := model.SeverityInfo
 
-	for i := range e.rules {
-		r := &e.rules[i]
+	now := time.Now().UTC()
+	evalOne := func(r *Rule) {
 		if !matchesRule(r, ev) {
-			continue
+			return
 		}
 		if e.isRuntimeAllowed(r.ID, ev) {
-			continue
+			return
 		}
 		matches = append(matches, model.PolicyMatch{
 			RuleID:      r.ID,
@@ -192,6 +288,52 @@ func (e *Engine) Evaluate(ev model.Event) ([]model.PolicyMatch, model.Action, mo
 		action = model.MaxAction(action, r.Action)
 		if r.Severity.Rank() > severity.Rank() {
 			severity = r.Severity
+		}
+	}
+
+	for i := range e.rules {
+		evalOne(&e.rules[i])
+	}
+
+	// Collect only matching virtual rules under RLock, then release RLock BEFORE calling vpGuard
+	// so filesystem/inode checks never run on non-matching events or block writers (P2-d).
+	var candidateVPs []Rule
+	for _, ve := range e.virtualRules {
+		if !ve.expiresAt.IsZero() && !now.Before(ve.expiresAt) {
+			continue
+		}
+		r := ve.rule
+		if matchesRule(&r, ev) && !e.isRuntimeAllowed(r.ID, ev) {
+			candidateVPs = append(candidateVPs, r)
+		}
+	}
+	vpGuard := e.vpExeGuard
+	e.mu.RUnlock()
+
+	if len(candidateVPs) > 0 {
+		// On sys_enter_execve, /proc/<pid>/exe still points to the parent shell (e.g. bash) before
+		// exec completes; only inspect ev.Exe for EventExec so vulnerable targets are not skipped (P2-a).
+		guardPID := ev.PID
+		if ev.Type == model.EventExec {
+			guardPID = 0
+		}
+		if vpGuard == nil || !vpGuard(guardPID, ev.Exe) {
+			for i := range candidateVPs {
+				r := &candidateVPs[i]
+				matches = append(matches, model.PolicyMatch{
+					RuleID:      r.ID,
+					RuleName:    r.Name,
+					Category:    r.Category,
+					Severity:    r.Severity,
+					Action:      r.Action,
+					Description: r.Description,
+					MITRE:       r.MITRE,
+				})
+				action = model.MaxAction(action, r.Action)
+				if r.Severity.Rank() > severity.Rank() {
+					severity = r.Severity
+				}
+			}
 		}
 	}
 
@@ -221,6 +363,20 @@ func matchesRule(r *Rule, ev model.Event) bool {
 			if ev.Exe == cleanSlash(allowedExe) {
 				return false
 			}
+		}
+	}
+
+	// Exact canonical executable match (used by zero-day virtual patches to contain vulnerable binaries).
+	if len(m.ExePaths) > 0 {
+		ok := false
+		for _, targetExe := range m.ExePaths {
+			if ev.Exe != "" && ev.Exe == cleanSlash(targetExe) {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return false
 		}
 	}
 

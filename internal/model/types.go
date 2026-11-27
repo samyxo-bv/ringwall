@@ -95,15 +95,17 @@ type Event struct {
 	UID       uint32        `json:"uid"`
 	StartTime uint64        `json:"start_time,omitempty"`
 	DirFD     int32         `json:"dirfd,omitempty"`
-	Comm        string        `json:"comm"`
-	Exe         string        `json:"exe,omitempty"`
-	Cwd         string        `json:"cwd,omitempty"`
-	Path         string        `json:"path,omitempty"`
-	RawPath      string        `json:"raw_path,omitempty"`
-	PathResolved bool          `json:"path_resolved,omitempty"`
-	Cmdline     string        `json:"cmdline,omitempty"`
-	ProcCmdline string        `json:"proc_cmdline,omitempty"`
-	Argv        []string      `json:"argv,omitempty"`
+	Comm              string        `json:"comm"`
+	Exe               string        `json:"exe,omitempty"`
+	Cwd               string        `json:"cwd,omitempty"`
+	Path              string        `json:"path,omitempty"`
+	RawPath           string        `json:"raw_path,omitempty"`
+	PathResolved      bool          `json:"path_resolved,omitempty"`
+	ResolveParentOnly bool          `json:"resolve_parent_only,omitempty"`
+	KernelBlocked     bool          `json:"kernel_blocked,omitempty"`
+	Cmdline           string        `json:"cmdline,omitempty"`
+	ProcCmdline       string        `json:"proc_cmdline,omitempty"`
+	Argv              []string      `json:"argv,omitempty"`
 	Flags     uint32        `json:"flags,omitempty"`
 	IsWrite   bool          `json:"is_write,omitempty"`
 	DstIP     string        `json:"dst_ip,omitempty"`
@@ -183,18 +185,25 @@ type Incident struct {
 }
 
 type DaemonStatus struct {
-	Version        string    `json:"version"`
-	Mode           string    `json:"mode"`
-	SensorMode     string    `json:"sensor_mode"`
-	StartedAt      time.Time `json:"started_at"`
-	PolicyCount    int       `json:"policy_count"`
-	EventsTotal    uint64    `json:"events_total"`
-	DroppedEvents  uint64    `json:"dropped_events"`
-	AISkipped      uint64    `json:"ai_skipped"`
-	IncidentsTotal uint64    `json:"incidents_total"`
-	FrozenCount    int       `json:"frozen_count"`
-	AIEnabled      bool      `json:"ai_enabled"`
-	AIStrategy     string    `json:"ai_strategy"`
-	AIModels       []string  `json:"ai_models"`
-	AuditLogPath   string    `json:"audit_log_path"`
+	Version              string    `json:"version"`
+	Mode                 string    `json:"mode"`
+	SensorMode           string    `json:"sensor_mode"`
+	OpenHook             string    `json:"open_hook,omitempty"`
+	LSMEnforceActive     bool      `json:"lsm_enforce_active"`
+	StartedAt            time.Time `json:"started_at"`
+	PolicyCount          int       `json:"policy_count"`
+	EventsTotal          uint64    `json:"events_total"`
+	DroppedEvents        uint64    `json:"dropped_events"`
+	AISkipped            uint64    `json:"ai_skipped"`
+	IncidentsTotal       uint64    `json:"incidents_total"`
+	FrozenCount          int       `json:"frozen_count"`
+	AIEnabled            bool      `json:"ai_enabled"`
+	AIStrategy           string    `json:"ai_strategy"`
+	AIModels             []string  `json:"ai_models"`
+	AuditLogPath         string    `json:"audit_log_path"`
+	ScannerEnabled       bool      `json:"scanner_enabled"`
+	PatcherMode          string    `json:"patcher_mode,omitempty"`
+	ActiveVirtualPatches int       `json:"active_virtual_patches"`
+	LastScanFindings     int       `json:"last_scan_findings"`
+	LastScanKEV          int       `json:"last_scan_kev"`
 }

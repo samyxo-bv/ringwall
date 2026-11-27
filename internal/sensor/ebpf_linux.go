@@ -10,25 +10,190 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
+	"strings"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
+	"golang.org/x/sys/unix"
 
 	"github.com/samyxo-bv/ringwall/internal/config"
 	"github.com/samyxo-bv/ringwall/internal/model"
 )
 
+// bpfFileKey matches struct file_key in ebpf/ringwall.bpf.c byte-for-byte.
+type bpfFileKey struct {
+	Ino uint64
+	Dev uint32
+	Pad uint32
+}
+
+// bpfExecDenyVal matches struct exec_deny_val in ebpf/ringwall.bpf.c byte-for-byte.
+type bpfExecDenyVal struct {
+	HasGen uint32
+	Gen    uint32
+}
+
 type ebpfSensor struct {
-	coll      *ebpf.Collection
-	links     []link.Link
-	reader    *ringbuf.Reader
-	statsMap  *ebpf.Map
-	openHook  string
-	chanDrops atomic.Uint64
+	coll               *ebpf.Collection
+	links              []link.Link
+	reader             *ringbuf.Reader
+	configMap          *ebpf.Map
+	statsMap           *ebpf.Map
+	denyExecMap        *ebpf.Map
+	openHook           string
+	lsmAttached        bool
+	lsmEnforce         atomic.Bool
+	execMapMu          sync.Mutex
+	pinnedExecKeys     map[bpfFileKey]struct{}
+	protectedExecPaths []string
+	chanDrops          atomic.Uint64
+}
+
+func bpfLSMAvailable() bool {
+	b, err := os.ReadFile("/sys/kernel/security/lsm")
+	if err != nil {
+		return false
+	}
+	for _, tok := range strings.Split(strings.TrimSpace(string(b)), ",") {
+		if strings.TrimSpace(tok) == "bpf" {
+			return true
+		}
+	}
+	return false
+}
+
+// fileKeysForPath returns kernel (s_dev, i_ino) identifiers for path, including parent-dir s_dev
+// so overlayfs lower-layer files match both their lower dev and overlayfs superblock s_dev.
+func fileKeysForPath(p string) []bpfFileKey {
+	fi, err := os.Stat(p)
+	if err != nil || fi.IsDir() {
+		return nil
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok || st.Ino == 0 {
+		return nil
+	}
+	toKernelDev := func(rawDev uint64) uint32 {
+		return uint32((unix.Major(rawDev) << 20) | (unix.Minor(rawDev) & 0xfffff))
+	}
+	primary := bpfFileKey{Ino: st.Ino, Dev: toKernelDev(uint64(st.Dev))}
+	keys := []bpfFileKey{primary}
+
+	if dirInfo, derr := os.Stat(filepath.Dir(p)); derr == nil {
+		if dst, ok := dirInfo.Sys().(*syscall.Stat_t); ok {
+			ddev := toKernelDev(uint64(dst.Dev))
+			if ddev != primary.Dev {
+				keys = append(keys, bpfFileKey{Ino: st.Ino, Dev: ddev})
+			}
+		}
+	}
+	return keys
+}
+
+// regularFileKeysNoFollow opens p with O_PATH|O_NOFOLLOW|O_CLOEXEC first (refusing final-component
+// symlinks and never blocking on FIFOs/devices, P2-e), Fstats the exact opened inode verifying
+// S_IFREG, and only then reopens /proc/self/fd/<fd> with O_RDONLY|O_NONBLOCK|O_NOCTTY|O_CLOEXEC to
+// read FS_IOC_GETVERSION (i_generation) on ext4/xfs/btrfs (P1-1).
+func regularFileKeysNoFollow(p string) ([]bpfFileKey, bpfExecDenyVal) {
+	var denyVal bpfExecDenyVal
+	pathFD, err := unix.Open(p, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, denyVal
+	}
+	defer unix.Close(pathFD)
+
+	var st unix.Stat_t
+	if err := unix.Fstat(pathFD, &st); err != nil {
+		return nil, denyVal
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Ino == 0 {
+		return nil, denyVal
+	}
+	if readFD, rerr := unix.Open(fmt.Sprintf("/proc/self/fd/%d", pathFD), unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOCTTY|unix.O_CLOEXEC, 0); rerr == nil {
+		// Linux FS_IOC_GETVERSION = _IOR('v', 1, long) (0x80087601 on 64-bit, 0x80047601 on 32-bit).
+		fsIOCGetVersion := uint(0x80007601) | (uint(unsafe.Sizeof(uintptr(0))) << 16)
+		if gen, gerr := unix.IoctlGetInt(readFD, fsIOCGetVersion); gerr == nil {
+			denyVal = bpfExecDenyVal{HasGen: 1, Gen: uint32(gen)}
+		}
+		_ = unix.Close(readFD)
+	}
+	toKernelDev := func(rawDev uint64) uint32 {
+		return uint32((unix.Major(rawDev) << 20) | (unix.Minor(rawDev) & 0xfffff))
+	}
+	primary := bpfFileKey{Ino: st.Ino, Dev: toKernelDev(uint64(st.Dev))}
+	keys := []bpfFileKey{primary}
+
+	if dirInfo, derr := os.Stat(filepath.Dir(p)); derr == nil {
+		if dst, ok := dirInfo.Sys().(*syscall.Stat_t); ok {
+			ddev := toKernelDev(uint64(dst.Dev))
+			if ddev != primary.Dev {
+				keys = append(keys, bpfFileKey{Ino: st.Ino, Dev: ddev})
+			}
+		}
+	}
+	return keys, denyVal
+}
+
+func populateAllowedSSHExes(m *ebpf.Map, configured []string) int {
+	if m == nil || len(configured) == 0 {
+		return 0
+	}
+	// Fail-closed zero-exemption default (empty list): defeats ssh -F, SSH_AUTH_SOCK ssh-add,
+	// and ssh-keygen same-UID LOLBin key leaks. Host operators explicitly opt into binaries via
+	// sensor.lsm_allowed_ssh_exes in ringwall.yaml.
+	val := uint32(1)
+	added := 0
+	for _, p := range configured {
+		for _, k := range fileKeysForPath(p) {
+			if err := m.Put(&k, &val); err == nil {
+				added++
+			}
+		}
+	}
+	return added
+}
+
+// populatePinnedSecretInodes pins existing SSH private key inodes into lsm_deny_file_inodes
+// so even hardlinks or source-renames are blocked synchronously by lsm/file_open.
+func populatePinnedSecretInodes(m *ebpf.Map) int {
+	if m == nil {
+		return 0
+	}
+	patterns := []string{
+		"/home/*/.ssh/id_*",
+		"/home/*/.ssh/*.pem",
+		"/home/*/.ssh/*.key",
+		"/root/.ssh/id_*",
+		"/root/.ssh/*.pem",
+		"/root/.ssh/*.key",
+	}
+	val := uint32(1)
+	added := 0
+	for _, pat := range patterns {
+		matches, err := filepath.Glob(pat)
+		if err != nil {
+			continue
+		}
+		for _, p := range matches {
+			if strings.HasSuffix(p, ".pub") {
+				continue
+			}
+			for _, k := range fileKeysForPath(p) {
+				if err := m.Put(&k, &val); err == nil {
+					added++
+				}
+			}
+		}
+	}
+	return added
 }
 
 func newEBPFSensor(cfg config.SensorConfig) (Sensor, error) {
@@ -49,9 +214,29 @@ func newEBPFSensor(cfg config.SensorConfig) (Sensor, error) {
 		return nil, fmt.Errorf("load bpf spec: %w", err)
 	}
 
+	lsmProgs := []string{
+		"trace_lsm_file_open",
+		"trace_lsm_mmap_file",
+		"trace_lsm_ptrace_access_check",
+		"trace_lsm_bprm_check",
+	}
+	lsmReady := bpfLSMAvailable()
+	if !lsmReady {
+		for _, p := range lsmProgs {
+			delete(spec.Programs, p)
+		}
+	}
+
 	coll, err := ebpf.NewCollection(spec)
+	if err != nil && lsmReady {
+		log.Printf("ringwall: eBPF LSM programs failed to load (%v); retrying without LSM hooks", err)
+		for _, p := range lsmProgs {
+			delete(spec.Programs, p)
+		}
+		lsmReady = false
+		coll, err = ebpf.NewCollection(spec)
+	}
 	if err != nil && spec.Programs["trace_security_file_open"] != nil {
-		// Graceful fallback for older or non-BTF kernels without fentry trampoline support.
 		log.Printf("ringwall: fentry/security_file_open unavailable (%v); falling back to syscall open tracepoints", err)
 		delete(spec.Programs, "trace_security_file_open")
 		coll, err = ebpf.NewCollection(spec)
@@ -67,27 +252,84 @@ func newEBPFSensor(cfg config.SensorConfig) (Sensor, error) {
 		coll.Close()
 	}
 
-	if cfgMap, ok := coll.Maps["config_map"]; ok {
-		key := uint32(0)
+	cfgMap := coll.Maps["config_map"]
+	if cfgMap != nil {
+		key0 := uint32(0)
 		selfPID := uint32(os.Getpid())
-		if err := cfgMap.Put(&key, &selfPID); err != nil {
+		if err := cfgMap.Put(&key0, &selfPID); err != nil {
 			cleanup(nil)
 			return nil, fmt.Errorf("set self pid in bpf config_map: %w", err)
 		}
+		key1 := uint32(1)
+		enforceVal := uint32(0)
+		if cfg.EnableLSMBlocking {
+			enforceVal = 1
+		}
+		_ = cfgMap.Put(&key1, &enforceVal)
 	}
 
-	links := make([]link.Link, 0, 14)
+	links := make([]link.Link, 0, 18)
+	openHook := ""
+	lsmOpenActive := false
 
-	// Attach primary kernel-resolved fentry/security_file_open (bpf_d_path) when available.
+	// Tier 1: Synchronous eBPF LSM pre-syscall blocking (when booted with lsm=...,bpf).
+	if lsmReady {
+		if prog := coll.Programs["trace_lsm_file_open"]; prog != nil {
+			sshCount := populateAllowedSSHExes(coll.Maps["allowed_ssh_exe_inodes"], cfg.LSMAllowedSSHExes)
+			pinCount := populatePinnedSecretInodes(coll.Maps["lsm_deny_file_inodes"])
+			l, attachErr := link.AttachLSM(link.LSMOptions{Program: prog})
+			if attachErr != nil {
+				log.Printf("ringwall: lsm/file_open attach failed (%v); falling back to fentry", attachErr)
+			} else {
+				links = append(links, l)
+				lsmOpenActive = true
+				openHook = "lsm/file_open"
+				log.Printf("ringwall: attached lsm/file_open (synchronous pre-read kernel blocking active; enforce=%v allowed_ssh=%d pinned_secrets=%d)",
+					cfg.EnableLSMBlocking, sshCount, pinCount)
+			}
+		}
+		if prog := coll.Programs["trace_lsm_mmap_file"]; prog != nil {
+			l, attachErr := link.AttachLSM(link.LSMOptions{Program: prog})
+			if attachErr != nil {
+				log.Printf("ringwall: optional lsm/mmap_file not attached: %v", attachErr)
+			} else {
+				links = append(links, l)
+				log.Printf("ringwall: attached lsm/mmap_file (fail-closed LD_PRELOAD/PKCS11 -EPERM guard active)")
+			}
+		}
+		if prog := coll.Programs["trace_lsm_ptrace_access_check"]; prog != nil {
+			l, attachErr := link.AttachLSM(link.LSMOptions{Program: prog})
+			if attachErr != nil {
+				log.Printf("ringwall: optional lsm/ptrace_access_check not attached: %v", attachErr)
+			} else {
+				links = append(links, l)
+				log.Printf("ringwall: attached lsm/ptrace_access_check (non-root SSH ptrace guard active)")
+			}
+		}
+		if prog := coll.Programs["trace_lsm_bprm_check"]; prog != nil {
+			l, attachErr := link.AttachLSM(link.LSMOptions{Program: prog})
+			if attachErr != nil {
+				log.Printf("ringwall: optional lsm/bprm_check_security not attached: %v", attachErr)
+			} else {
+				links = append(links, l)
+				log.Printf("ringwall: attached lsm/bprm_check_security (synchronous virtual-patch exec blocking active)")
+			}
+		}
+	}
+
+	// Tier 2: Kernel-resolved fentry/security_file_open (bpf_d_path) when LSM is not active.
 	fentryOpenActive := false
-	if prog := coll.Programs["trace_security_file_open"]; prog != nil {
-		l, attachErr := link.AttachTracing(link.TracingOptions{Program: prog})
-		if attachErr != nil {
-			log.Printf("ringwall: fentry/security_file_open attach failed (%v); falling back to syscall open tracepoints", attachErr)
-		} else {
-			links = append(links, l)
-			fentryOpenActive = true
-			log.Printf("ringwall: attached fentry/security_file_open (kernel bpf_d_path canonicalization active)")
+	if !lsmOpenActive {
+		if prog := coll.Programs["trace_security_file_open"]; prog != nil {
+			l, attachErr := link.AttachTracing(link.TracingOptions{Program: prog})
+			if attachErr != nil {
+				log.Printf("ringwall: fentry/security_file_open attach failed (%v); falling back to syscall open tracepoints", attachErr)
+			} else {
+				links = append(links, l)
+				fentryOpenActive = true
+				openHook = "fentry/security_file_open"
+				log.Printf("ringwall: attached fentry/security_file_open (kernel bpf_d_path canonicalization active)")
+			}
 		}
 	}
 
@@ -111,8 +353,8 @@ func newEBPFSensor(cfg config.SensorConfig) (Sensor, error) {
 		{prog: "trace_sendto", group: "syscalls", name: "sys_enter_sendto", optional: true},
 		{prog: "trace_io_uring_setup", group: "syscalls", name: "sys_enter_io_uring_setup", optional: true},
 	}
-	openHook := "fentry/security_file_open"
-	if !fentryOpenActive {
+	// Tier 3: Raw syscall open tracepoints fallback.
+	if !lsmOpenActive && !fentryOpenActive {
 		openHook = "tracepoint/sys_enter_openat"
 		specs = append(specs,
 			tpSpec{prog: "trace_openat", group: "syscalls", name: "sys_enter_openat"},
@@ -156,17 +398,123 @@ func newEBPFSensor(cfg config.SensorConfig) (Sensor, error) {
 		return nil, fmt.Errorf("open bpf ringbuf: %w", err)
 	}
 
-	return &ebpfSensor{
-		coll:     coll,
-		links:    links,
-		reader:   rd,
-		statsMap: coll.Maps["stats_map"],
-		openHook: openHook,
-	}, nil
+	s := &ebpfSensor{
+		coll:           coll,
+		links:          links,
+		reader:         rd,
+		configMap:      cfgMap,
+		statsMap:       coll.Maps["stats_map"],
+		denyExecMap:    coll.Maps["lsm_deny_exec_inodes"],
+		openHook:       openHook,
+		lsmAttached:    lsmOpenActive,
+		pinnedExecKeys: make(map[bpfFileKey]struct{}),
+	}
+	s.lsmEnforce.Store(lsmOpenActive && cfg.EnableLSMBlocking)
+	return s, nil
 }
 
-func (s *ebpfSensor) Mode() string     { return "ebpf" }
-func (s *ebpfSensor) OpenHook() string { return s.openHook }
+func (s *ebpfSensor) Mode() string           { return "ebpf" }
+func (s *ebpfSensor) OpenHook() string       { return s.openHook }
+func (s *ebpfSensor) LSMEnforceActive() bool { return s.lsmAttached && s.lsmEnforce.Load() }
+
+// SetLSMEnforce toggles synchronous -EPERM kernel blocking dynamically (e.g. off in audit mode, on in interactive/strict).
+func (s *ebpfSensor) SetLSMEnforce(enabled bool) error {
+	if s.configMap == nil {
+		return nil
+	}
+	key := uint32(1)
+	val := uint32(0)
+	if enabled && s.lsmAttached {
+		val = 1
+	}
+	if err := s.configMap.Put(&key, &val); err != nil {
+		return err
+	}
+	s.lsmEnforce.Store(val == 1)
+	return nil
+}
+
+// SetProtectedExecPaths stores the protected system binary paths to be re-statted live on every
+// SyncBlockedExecPaths call so newly upgraded system binaries can never be blocked (P1-1).
+func (s *ebpfSensor) SetProtectedExecPaths(paths []string) {
+	s.execMapMu.Lock()
+	defer s.execMapMu.Unlock()
+	cp := make([]string, len(paths))
+	copy(cp, paths)
+	s.protectedExecPaths = cp
+}
+
+func (s *ebpfSensor) liveProtectedExecKeysLocked() map[bpfFileKey]struct{} {
+	keys := make(map[bpfFileKey]struct{}, len(s.protectedExecPaths)*2)
+	add := func(p string) {
+		for _, k := range fileKeysForPath(p) {
+			keys[k] = struct{}{}
+		}
+	}
+	for _, p := range s.protectedExecPaths {
+		add(p)
+	}
+	for _, pat := range []string{
+		"/lib/systemd/systemd*",
+		"/usr/lib/systemd/systemd*",
+		"/usr/lib/openssh/*",
+		"/lib/openssh/*",
+		"/usr/libexec/openssh/*",
+	} {
+		if matches, err := filepath.Glob(pat); err == nil {
+			for _, m := range matches {
+				add(m)
+			}
+		}
+	}
+	return keys
+}
+
+// SyncBlockedExecPaths reconciles lsm_deny_exec_inodes with active zero-day virtual-patched executable paths.
+// Re-stats protected binaries live on every call, removes any stale entry matching a freshly-statted
+// protected inode, uses O_NOFOLLOW on the final path component, and attaches FS_IOC_GETVERSION
+// i_generation where supported so reused inode numbers never block upgraded system binaries (P1-1 / P1-B).
+func (s *ebpfSensor) SyncBlockedExecPaths(paths []string) (int, error) {
+	if !s.lsmAttached || s.denyExecMap == nil {
+		return 0, nil
+	}
+	s.execMapMu.Lock()
+	defer s.execMapMu.Unlock()
+
+	protectedKeys := s.liveProtectedExecKeysLocked()
+	desired := make(map[bpfFileKey]bpfExecDenyVal)
+	for _, p := range paths {
+		keys, denyVal := regularFileKeysNoFollow(p)
+		protected := false
+		for _, k := range keys {
+			if _, hit := protectedKeys[k]; hit {
+				protected = true
+				break
+			}
+		}
+		if protected {
+			continue
+		}
+		for _, k := range keys {
+			desired[k] = denyVal
+		}
+	}
+	for old := range s.pinnedExecKeys {
+		_, keep := desired[old]
+		_, isProt := protectedKeys[old]
+		if !keep || isProt {
+			_ = s.denyExecMap.Delete(&old)
+			delete(s.pinnedExecKeys, old)
+		}
+	}
+	for k, val := range desired {
+		v := val
+		if err := s.denyExecMap.Put(&k, &v); err == nil {
+			s.pinnedExecKeys[k] = struct{}{}
+		}
+	}
+	return len(s.pinnedExecKeys), nil
+}
 
 // Dropped returns the sum of kernel ringbuf reserve drops plus userspace channel drops.
 func (s *ebpfSensor) Dropped() uint64 {

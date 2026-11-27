@@ -110,11 +110,13 @@ chroot "${CHROOT}" passwd -l root
 chroot "${CHROOT}" useradd -m -s /bin/bash -N -g users operator
 chroot "${CHROOT}" passwd -l operator
 
-# Pre-seed a harmless canary decoy key so users and QEMU E2E tests can safely verify live eBPF freezing.
+# Pre-seed a harmless canary decoy key (plus a preexisting hardlink outside .ssh)
+# so users and QEMU E2E tests prove both path-based and inode-pinned synchronous eBPF LSM blocking.
 install -d -m 0700 "${CHROOT}/home/operator/.ssh"
 printf 'RINGWALL-CANARY-DECOY-NOT-A-REAL-PRIVATE-KEY\n' > "${CHROOT}/home/operator/.ssh/id_ed25519"
 chmod 0600 "${CHROOT}/home/operator/.ssh/id_ed25519"
-chroot "${CHROOT}" chown -R operator:users /home/operator/.ssh
+ln "${CHROOT}/home/operator/.ssh/id_ed25519" "${CHROOT}/home/operator/preexisting_hardlink_canary"
+chroot "${CHROOT}" chown -R operator:users /home/operator/.ssh /home/operator/preexisting_hardlink_canary
 
 # Local/serial appliance autologin as strictly unprivileged monitored user (no SSH server installed).
 mkdir -p "${CHROOT}/etc/systemd/system/serial-getty@ttyS0.service.d"
@@ -198,8 +200,8 @@ serial --unit=0 --speed=115200 --word=8 --parity=no --stop=1
 terminal_input console serial
 terminal_output console serial
 
-menuentry "Ringwall Hardened Immutable Appliance (eBPF + Local AI Guardian)" {
-    linux /live/vmlinuz boot=live components quiet console=tty0 console=ttyS0,115200n8 lockdown=integrity init_on_alloc=1 init_on_free=1 slab_nomerge pti=on randomize_kstack_offset=on
+menuentry "Ringwall Hardened Immutable Appliance (eBPF LSM + Local AI Guardian)" {
+    linux /live/vmlinuz boot=live components quiet console=tty0 console=ttyS0,115200n8 lsm=lockdown,yama,integrity,apparmor,bpf ringwall.slot=A lockdown=integrity init_on_alloc=1 init_on_free=1 slab_nomerge pti=on randomize_kstack_offset=on
     initrd /live/initrd.img
 }
 EOF

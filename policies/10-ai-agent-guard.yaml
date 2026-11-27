@@ -3,12 +3,12 @@
 # from reading host secrets, exfiltrating credentials, or executing destructive wipe loops.
 rules:
   - id: RW-AGENT-001
-    name: Non-SSH binary accessing SSH private keys
+    name: Process accessing SSH private keys
     category: ai-agent-guard
     severity: critical
     action: freeze
     mitre: T1552.004
-    description: Detects scripts, AI agents, or unknown binaries opening SSH private keys (paths canonicalized across cwd, dirfd, /proc/self/root, and symlinks).
+    description: Detects any process opening SSH private keys by default (zero default exemptions to prevent ssh -F / SSH_AUTH_SOCK ssh-add LOLBin exfiltration). Host operators who opt into local SSH tools can add exact canonical paths under exclude_exe_paths and sensor.lsm_allowed_ssh_exes.
     match:
       event_types: [open]
       path_globs:
@@ -17,11 +17,6 @@ rules:
         - '**/.ssh/*.key'
       exclude_path_globs:
         - '**/.ssh/*.pub'
-      exclude_exe_paths:
-        - '/usr/bin/ssh'
-        - '/usr/bin/ssh-agent'
-        - '/usr/bin/ssh-add'
-        - '/usr/bin/ssh-keygen'
 
   - id: RW-AGENT-002
     name: AI agent accessing cloud, Kubernetes, or GPG credentials

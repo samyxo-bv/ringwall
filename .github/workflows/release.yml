@@ -17,7 +17,7 @@ jobs:
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: "1.24"
+          go-version: "1.27"
 
       - name: Install toolchain, ISO builder & QEMU
         run: |
@@ -49,10 +49,34 @@ jobs:
           sudo ./iso/build-iso.sh --out "dist/ringwall-${GITHUB_REF_NAME}-appliance-amd64.iso"
           ./iso/test-qemu.sh "dist/ringwall-${GITHUB_REF_NAME}-appliance-amd64.iso"
 
-      - name: Generate combined SHA256SUMS
+      - name: Generate combined SHA256SUMS and A/B update manifest
+        env:
+          RINGWALL_AB_SIGNING_KEY: ${{ secrets.RINGWALL_AB_SIGNING_KEY }}
         run: |
           cd dist
-          sha256sum "ringwall-${GITHUB_REF_NAME}-linux-amd64.tar.gz" "ringwall-${GITHUB_REF_NAME}-appliance-amd64.iso" > SHA256SUMS.txt
+          ISO_NAME="ringwall-${GITHUB_REF_NAME}-appliance-amd64.iso"
+          TAR_NAME="ringwall-${GITHUB_REF_NAME}-linux-amd64.tar.gz"
+          sha256sum "${TAR_NAME}" "${ISO_NAME}" > SHA256SUMS.txt
+          RELEASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${ISO_NAME}"
+          if [ -n "${RINGWALL_AB_SIGNING_KEY:-}" ]; then
+            printf '%s\n' "${RINGWALL_AB_SIGNING_KEY}" > /tmp/ab.priv
+            chmod 0600 /tmp/ab.priv
+            ../bin/ringwallctl ab-sign /tmp/ab.priv "${GITHUB_REF_NAME}" "${RELEASE_URL}" "${ISO_NAME}" "ringwall-${GITHUB_REF_NAME}-ab-manifest.json"
+            rm -f /tmp/ab.priv
+          else
+            ISO_HASH="$(sha256sum "${ISO_NAME}" | awk '{print $1}')"
+            ISO_SIZE="$(stat -c '%s' "${ISO_NAME}")"
+            cat > "ringwall-${GITHUB_REF_NAME}-ab-manifest.json" <<EOF
+          {
+            "version": "${GITHUB_REF_NAME}",
+            "release_url": "${RELEASE_URL}",
+            "image_sha256": "${ISO_HASH}",
+            "image_size": ${ISO_SIZE},
+            "published_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "signature_ed25519_b64": ""
+          }
+          EOF
+          fi
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
@@ -61,4 +85,5 @@ jobs:
           files: |
             dist/ringwall-*-linux-amd64.tar.gz
             dist/ringwall-*-appliance-amd64.iso
+            dist/ringwall-*-ab-manifest.json
             dist/SHA256SUMS.txt

@@ -9,18 +9,20 @@ Type=simple
 ExecStart=/usr/local/bin/ringwalld -config /etc/ringwall/ringwall.yaml
 Restart=always
 RestartSec=2s
-# Root-only 0700 control/log directories: monitored unprivileged users NEVER read api.token or audit.jsonl.
+# Root-only 0700 control/log/state directories: monitored unprivileged users NEVER read api.token or audit.jsonl.
 RuntimeDirectory=ringwall ringwall-status
 RuntimeDirectoryMode=0700
 LogsDirectory=ringwall
 LogsDirectoryMode=0700
+StateDirectory=ringwall
+StateDirectoryMode=0700
 
 # Least-privilege systemd hardening while retaining BPF/procfs-exe/signal/nftables capabilities.
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=read-only
 ProtectSystem=strict
-ReadWritePaths=/var/log/ringwall /run/ringwall /run/ringwall-status /etc/ringwall /sys/fs/cgroup
+ReadWritePaths=/var/log/ringwall /var/lib/ringwall /run/ringwall /run/ringwall-status /etc/ringwall /sys/fs/cgroup
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
 RestrictNamespaces=yes

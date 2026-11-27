@@ -20,7 +20,9 @@ import (
 	"github.com/samyxo-bv/ringwall/internal/guardian"
 	"github.com/samyxo-bv/ringwall/internal/lineage"
 	"github.com/samyxo-bv/ringwall/internal/model"
+	"github.com/samyxo-bv/ringwall/internal/patcher"
 	"github.com/samyxo-bv/ringwall/internal/policy"
+	"github.com/samyxo-bv/ringwall/internal/scanner"
 	"github.com/samyxo-bv/ringwall/internal/sensor"
 )
 
@@ -60,6 +62,15 @@ type Daemon struct {
 
 	subMu       sync.Mutex
 	subscribers map[chan model.Incident]struct{}
+
+	selfHealMu sync.RWMutex
+	patchMu    sync.Mutex
+	scanner    *scanner.Scanner
+	vpatches   *patcher.VirtualPatchManager
+	abUpdater  *patcher.ABUpdater
+	lastScan   *scanner.ScanReport
+	lastPatch  *patcher.ApplySummary
+	cmdRunner  patcher.CmdRunner
 }
 
 func New(
@@ -72,7 +83,7 @@ func New(
 	guard *guardian.Guardian,
 	alog *audit.Log,
 ) *Daemon {
-	return &Daemon{
+	d := &Daemon{
 		version:     version,
 		cfg:         cfg,
 		sensor:      s,
@@ -88,6 +99,9 @@ func New(
 		byID:        make(map[string]*model.Incident, 128),
 		subscribers: make(map[chan model.Incident]struct{}),
 	}
+	d.initSelfHealing(cfg)
+	d.syncLSMEnforce(cfg)
+	return d
 }
 
 func (d *Daemon) SetStoragePaths(cfgPath, keyDir string) {
@@ -125,6 +139,8 @@ func (d *Daemon) ReloadConfig(next *config.Config) {
 	if d.guardian != nil {
 		d.guardian.Reload(next.AI)
 	}
+	d.initSelfHealing(next)
+	d.syncLSMEnforce(next)
 	d.recordAudit("daemon.config_reloaded", map[string]any{
 		"mode":        next.Mode,
 		"ai_enabled":  next.AI.Enabled,
@@ -150,8 +166,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}()
 
 	d.writePublicStatus()
+	d.confirmStartupABHealth()
 	dropTicker := time.NewTicker(2 * time.Second)
 	defer dropTicker.Stop()
+
+	scanInterval := time.Duration(d.Config().Scanner.IntervalMin) * time.Minute
+	if scanInterval <= 0 {
+		scanInterval = 60 * time.Minute
+	}
+	scanTicker := time.NewTicker(scanInterval)
+	defer scanTicker.Stop()
 
 	for {
 		select {
@@ -162,6 +186,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		case <-dropTicker.C:
 			d.CheckDrops()
 			d.writePublicStatus()
+		case <-scanTicker.C:
+			if d.Config().Scanner.Enabled {
+				go d.backgroundSelfHealTick(ctx)
+			}
 		case ev := <-evCh:
 			d.ProcessEvent(ctx, ev, false)
 		}
@@ -223,23 +251,21 @@ func (d *Daemon) writePublicStatus() {
 		return
 	}
 	st := d.Status()
-	openHook := ""
-	if rep, ok := d.sensor.(sensor.OpenHookReporter); ok {
-		openHook = rep.OpenHook()
-	}
 	// Strictly non-sensitive read-only health snapshot (zero tokens, zero secrets).
 	snap := map[string]any{
-		"version":         st.Version,
-		"mode":            st.Mode,
-		"sensor_mode":     st.SensorMode,
-		"open_hook":       openHook,
-		"policy_count":    st.PolicyCount,
-		"events_total":    st.EventsTotal,
-		"dropped_events":  st.DroppedEvents,
-		"ai_skipped":      st.AISkipped,
-		"incidents_total": st.IncidentsTotal,
-		"frozen_count":    st.FrozenCount,
-		"updated_at":      time.Now().UTC().Format(time.RFC3339),
+		"version":                st.Version,
+		"mode":                   st.Mode,
+		"sensor_mode":            st.SensorMode,
+		"open_hook":              st.OpenHook,
+		"lsm_enforce_active":     st.LSMEnforceActive,
+		"policy_count":           st.PolicyCount,
+		"active_virtual_patches": st.ActiveVirtualPatches,
+		"events_total":           st.EventsTotal,
+		"dropped_events":         st.DroppedEvents,
+		"ai_skipped":             st.AISkipped,
+		"incidents_total":        st.IncidentsTotal,
+		"frozen_count":           st.FrozenCount,
+		"updated_at":             time.Now().UTC().Format(time.RFC3339),
 	}
 	b, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
@@ -274,6 +300,18 @@ func (d *Daemon) ProcessEvent(ctx context.Context, ev model.Event, syncAI bool) 
 
 	matches, detAction, severity := d.policy.Evaluate(ev)
 	injFlags := guardian.DetectPromptInjection(ev)
+	if ev.KernelBlocked && len(matches) == 0 {
+		matches = append(matches, model.PolicyMatch{
+			RuleID:      "RW-LSM-BLOCK",
+			RuleName:    "Synchronous eBPF LSM pre-syscall block (-EPERM)",
+			Category:    "kernel-lsm",
+			Severity:    model.SeverityCritical,
+			Action:      model.ActionFreeze,
+			Description: "Kernel eBPF LSM synchronously denied access (pinned secret inode, SSH private key, or virtual-patched binary) before any data was read or executed.",
+		})
+		detAction = model.MaxAction(detAction, model.ActionFreeze)
+		severity = model.SeverityCritical
+	}
 	if len(matches) == 0 && len(injFlags) == 0 {
 		return nil
 	}
@@ -290,6 +328,12 @@ func (d *Daemon) ProcessEvent(ctx context.Context, ev model.Event, syncAI bool) 
 	// Step 1: Deterministic enforcement executes IMMEDIATELY before any LLM latency.
 	enf := d.currentEnforcer()
 	status, cgPath, note := enf.Apply(ev, detAction)
+	if ev.KernelBlocked {
+		note = "blocked synchronously by eBPF LSM (-EPERM); " + note
+		if status == model.StatusOpen {
+			status = model.StatusBlocked
+		}
+	}
 
 	now := time.Now().UTC()
 	inc := &model.Incident{
@@ -529,25 +573,52 @@ func (d *Daemon) Status() model.DaemonStatus {
 		aiModels = d.guardian.ModelNames()
 	}
 	var dropped uint64
+	openHook := ""
+	lsmEnforce := false
 	if d.sensor != nil {
 		dropped = d.sensor.Dropped()
+		if rep, ok := d.sensor.(sensor.OpenHookReporter); ok {
+			openHook = rep.OpenHook()
+		}
+		if ctrl, ok := d.sensor.(sensor.LSMController); ok {
+			lsmEnforce = ctrl.LSMEnforceActive()
+		}
 	}
 
+	activeVP := 0
+	if d.vpatches != nil {
+		activeVP = len(d.vpatches.List())
+	}
+	lastFindings, lastKEV := 0, 0
+	d.selfHealMu.RLock()
+	if d.lastScan != nil {
+		lastFindings = len(d.lastScan.Findings)
+		lastKEV = d.lastScan.KEVCount
+	}
+	d.selfHealMu.RUnlock()
+
 	return model.DaemonStatus{
-		Version:        d.version,
-		Mode:           string(cfg.Mode),
-		SensorMode:     d.sensor.Mode(),
-		StartedAt:      d.startedAt,
-		PolicyCount:    d.policy.Count(),
-		EventsTotal:    d.eventsTotal.Load(),
-		DroppedEvents:  dropped,
-		AISkipped:      d.aiSkipped.Load(),
-		IncidentsTotal: d.incidentsTotal.Load(),
-		FrozenCount:    frozen,
-		AIEnabled:      cfg.AI.Enabled && len(aiModels) > 0,
-		AIStrategy:     cfg.AI.Strategy,
-		AIModels:       aiModels,
-		AuditLogPath:   cfg.AuditLogPath,
+		Version:              d.version,
+		Mode:                 string(cfg.Mode),
+		SensorMode:           d.sensor.Mode(),
+		OpenHook:             openHook,
+		LSMEnforceActive:     lsmEnforce,
+		StartedAt:            d.startedAt,
+		PolicyCount:          d.policy.Count(),
+		EventsTotal:          d.eventsTotal.Load(),
+		DroppedEvents:        dropped,
+		AISkipped:            d.aiSkipped.Load(),
+		IncidentsTotal:       d.incidentsTotal.Load(),
+		FrozenCount:          frozen,
+		AIEnabled:            cfg.AI.Enabled && len(aiModels) > 0,
+		AIStrategy:           cfg.AI.Strategy,
+		AIModels:             aiModels,
+		AuditLogPath:         cfg.AuditLogPath,
+		ScannerEnabled:       cfg.Scanner.Enabled,
+		PatcherMode:          cfg.Patcher.Mode,
+		ActiveVirtualPatches: activeVP,
+		LastScanFindings:     lastFindings,
+		LastScanKEV:          lastKEV,
 	}
 }
 

@@ -18,6 +18,7 @@ import (
 
 	"github.com/samyxo-bv/ringwall/internal/config"
 	"github.com/samyxo-bv/ringwall/internal/daemon"
+	"github.com/samyxo-bv/ringwall/internal/patcher"
 	"github.com/samyxo-bv/ringwall/internal/setup"
 )
 
@@ -52,6 +53,12 @@ func NewServer(d *daemon.Daemon, cfg config.APIConfig) (*Server, error) {
 	mux.HandleFunc("/api/v1/setup/info", s.requireAuth(s.handleSetupInfo))
 	mux.HandleFunc("/api/v1/setup/test-model", s.requireAuth(s.handleSetupTestModel))
 	mux.HandleFunc("/api/v1/setup/apply", s.requireAuth(s.handleSetupApply))
+	mux.HandleFunc("/api/v1/scan", s.requireAuth(s.handleScan))
+	mux.HandleFunc("/api/v1/patch", s.requireAuth(s.handlePatch))
+	mux.HandleFunc("/api/v1/virtual-patches", s.requireAuth(s.handleVirtualPatches))
+	mux.HandleFunc("/api/v1/virtual-patches/", s.requireAuth(s.handleVirtualPatchItem))
+	mux.HandleFunc("/api/v1/ab/status", s.requireAuth(s.handleABStatus))
+	mux.HandleFunc("/api/v1/ab/stage", s.requireAuth(s.handleABStage))
 
 	s.http = &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -298,6 +305,99 @@ func (s *Server) handleSetupApply(w http.ResponseWriter, r *http.Request) {
 		"saved":  true,
 		"status": s.daemon.Status(),
 	})
+}
+
+func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		if rep := s.daemon.LastScan(); rep != nil {
+			writeJSON(w, http.StatusOK, rep)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"scanned": false})
+	case http.MethodPost:
+		writeJSON(w, http.StatusOK, s.daemon.RunScan(r.Context()))
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		DryRun *bool `json:"dry_run,omitempty"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req)
+	}
+	writeJSON(w, http.StatusOK, s.daemon.RunPatchCycle(r.Context(), req.DryRun))
+}
+
+func (s *Server) handleVirtualPatches(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, s.daemon.VirtualPatches())
+	case http.MethodPost:
+		var vp patcher.VirtualPatch
+		if err := json.NewDecoder(io.LimitReader(r.Body, 16384)).Decode(&vp); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		applied, err := s.daemon.ApplyVirtualPatch(vp)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, applied)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleVirtualPatchItem(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/api/v1/virtual-patches/")
+	if id == "" || strings.Contains(id, "/") {
+		http.NotFound(w, r)
+		return
+	}
+	if !s.daemon.RevokeVirtualPatch(id) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "virtual patch not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"revoked": true, "id": id})
+}
+
+func (s *Server) handleABStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.daemon.ABStatus())
+}
+
+func (s *Server) handleABStage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var m patcher.ABManifest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 32768)).Decode(&m); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	st, err := s.daemon.StageABUpdate(r.Context(), m)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
 }
 
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {

@@ -72,6 +72,7 @@
   <h1>RING<span>WALL</span> // Local Runtime Guardian</h1>
   <div class="tabs">
     <button class="tab active" id="tab-dash" onclick="showTab('dash')">Live Monitor</button>
+    <button class="tab" id="tab-heal" onclick="showTab('heal')">CVE Scanner &amp; Self-Healing</button>
     <button class="tab" id="tab-setup" onclick="showTab('setup')">Setup Wizard (AI &amp; Protection)</button>
   </div>
   <div class="controls">
@@ -96,7 +97,33 @@
     <div id="list"><div class="empty">Paste your API token from <code>/run/ringwall/api.token</code> and click <strong>Connect</strong>. New here? Open the <strong>Setup Wizard</strong> tab above.</div></div>
   </section>
 
-  <!-- VIEW 2: GUIDED SETUP WIZARD FOR NON-TECHNICAL USERS -->
+  <!-- VIEW 2: CVE SCANNER, VIRTUAL PATCHING & A/B SELF-HEALING -->
+  <section id="view-heal" class="hidden">
+    <div class="wiz-step">
+      <h2>Live CVE, CISA KEV, Stale-Library &amp; Kernel Drift Scanner</h2>
+      <div class="meta">Scans local dpkg/apk inventory against OSV.dev + CISA KEV (or offline advisory DB), detects stale deleted <code>.so</code> libraries needing service restart, audits kernel sysctl/file-permission drift, and applies deterministic auto-patches or TTL-bounded zero-day virtual patches.</div>
+      <div class="actions">
+        <button class="primary" onclick="runScan()">Run CVE &amp; Drift Scan Now</button>
+        <button onclick="runPatch(true)">Dry-Run Patch Plan</button>
+        <button class="ok" onclick="runPatch(false)">Apply Auto-Patch &amp; Virtual Patches</button>
+      </div>
+      <div id="scan-summary" class="ai-box hidden"></div>
+      <div id="patch-summary" class="ai-box hidden"></div>
+    </div>
+
+    <div class="wiz-step">
+      <h2>Active Zero-Day Virtual Patches (TTL-Bounded, Anti-Lockout Validated)</h2>
+      <div class="meta">Temporary containment rules active in policy engine and kernel <code>lsm/bprm_check_security</code>; auto-revoked once upstream CVE patch is installed.</div>
+      <div id="vp-list" class="meta">Connect with your API token to view active virtual patches.</div>
+    </div>
+
+    <div class="wiz-step">
+      <h2>Immutable Appliance Signed A/B Boot Slots</h2>
+      <div id="ab-box" class="mono meta">Connect with your API token to inspect A/B slot state.</div>
+    </div>
+  </section>
+
+  <!-- VIEW 3: GUIDED SETUP WIZARD FOR NON-TECHNICAL USERS -->
   <section id="view-setup" class="hidden">
     <div class="info-banner">
       <h2 id="exp-title" style="margin:0 0 6px 0;font-size:16px">Why Ringwall uses an Uncensored (Abliterated) AI Model</h2>
@@ -189,10 +216,13 @@ function esc(s) {
 }
 function showTab(name) {
   document.getElementById('view-dash').classList.toggle('hidden', name !== 'dash');
+  document.getElementById('view-heal').classList.toggle('hidden', name !== 'heal');
   document.getElementById('view-setup').classList.toggle('hidden', name !== 'setup');
   document.getElementById('tab-dash').classList.toggle('active', name === 'dash');
+  document.getElementById('tab-heal').classList.toggle('active', name === 'heal');
   document.getElementById('tab-setup').classList.toggle('active', name === 'setup');
   if (name === 'setup' && tokenInput.value.trim()) loadSetupInfo();
+  if (name === 'heal' && tokenInput.value.trim()) loadSelfHeal();
 }
 function pickMode(m) {
   selectedMode = m;
@@ -222,7 +252,7 @@ async function refresh() {
   const st = await stRes.json();
   const list = await incRes.json();
   document.getElementById('st-conn').textContent = 'ONLINE (' + st.version + ')';
-  document.getElementById('st-sensor').textContent = st.sensor_mode;
+  document.getElementById('st-sensor').textContent = st.sensor_mode + (st.open_hook ? ' (' + st.open_hook + (st.lsm_enforce_active ? ' BLOCKING' : '') + ')' : '');
   document.getElementById('st-mode').textContent = st.mode + ' / ' + st.policy_count;
   document.getElementById('st-counts').textContent = st.frozen_count + ' / ' + st.incidents_total;
   document.getElementById('st-ai').textContent = st.ai_enabled ? (st.ai_strategy + ' (' + (st.ai_models||[]).length + ')') : 'deterministic';
@@ -398,6 +428,73 @@ async function verifyAudit() {
   document.getElementById('banner').textContent = data.valid
     ? 'Audit hash-chain VALID (' + data.entries + ' entries verified).'
     : 'Audit hash-chain INVALID: ' + data.error;
+}
+
+async function loadSelfHeal() {
+  const [vpRes, abRes] = await Promise.all([
+    fetch('/api/v1/virtual-patches', { headers: headers() }),
+    fetch('/api/v1/ab/status', { headers: headers() }),
+  ]);
+  if (vpRes.ok) renderVirtualPatches(await vpRes.json());
+  if (abRes.ok) {
+    const ab = await abRes.json();
+    document.getElementById('ab-box').textContent =
+      `Active Slot: ${ab.active_slot} (${ab.current_version || '-'}) · Last Known Good: ${ab.last_known_good_slot} · Pending: ${ab.pending_slot || 'none'} · Health Confirmed: ${ab.health_confirmed ? 'yes' : 'no'}${ab.rolled_back_from ? ' · Rolled back from: ' + ab.rolled_back_from : ''}`;
+  }
+}
+
+function renderVirtualPatches(list) {
+  const el = document.getElementById('vp-list');
+  if (!list || list.length === 0) {
+    el.innerHTML = '<div class="meta">No active zero-day virtual patches.</div>';
+    return;
+  }
+  el.innerHTML = list.map(vp => `
+    <div class="ai-box">
+      <div class="row">
+        <div><strong class="mono">${esc(vp.id)}</strong> · ${esc(vp.cve)} (${esc(vp.package)}) · <span class="badge ${vp.kernel_lsm_active ? 'pass' : 'frozen'}">${vp.kernel_lsm_active ? 'KERNEL LSM -EPERM' : esc(vp.action)}</span></div>
+        <button class="danger" onclick="revokeVP('${esc(vp.id)}')">Revoke</button>
+      </div>
+      <div class="meta">${esc(vp.rationale)} · Targets: <code>${esc((vp.target_exe_paths||[]).concat(vp.target_path_globs||[]).join(', '))}</code> · Expires: ${esc(vp.expires_at)}</div>
+    </div>
+  `).join('');
+}
+
+async function revokeVP(id) {
+  await fetch('/api/v1/virtual-patches/' + encodeURIComponent(id), { method: 'DELETE', headers: headers() });
+  await loadSelfHeal();
+  await refresh();
+}
+
+async function runScan() {
+  const box = document.getElementById('scan-summary');
+  box.classList.remove('hidden');
+  box.textContent = 'Running CVE, KEV, stale-library, and drift scan...';
+  const res = await fetch('/api/v1/scan', { method: 'POST', headers: headers() });
+  const rep = await res.json();
+  const findings = (rep.findings || []).map(f => `<li><span class="badge ${esc(f.severity)}">${esc(f.severity)}</span> ${f.in_kev ? '<span class="badge critical">CISA KEV</span> ' : ''}<strong class="mono">${esc(f.cve || f.id)}</strong> ${esc(f.package)} ${esc(f.installed_version)} → ${esc(f.fixed_version || 'NO UPSTREAM FIX (0-day)')} [lane: <code>${esc(f.lane)}</code>]</li>`).join('');
+  const drifts = (rep.drift || []).map(d => `<li><span class="badge warn">DRIFT</span> ${esc(d.target)}: got <code>${esc(d.actual)}</code>, expected <code>${esc(d.expected)}</code></li>`).join('');
+  box.innerHTML = `
+    <div><strong>Scan Complete (${rep.duration_ms || 0} ms)</strong> — Ecosystem: <code>${esc(rep.ecosystem)}</code> · Packages: ${rep.package_count} · Findings: <strong>${(rep.findings||[]).length}</strong> (KEV: ${rep.kev_count}, Immediate: ${rep.immediate_count}, Virtual 0-Day: ${rep.virtual_count}) · Drift: ${(rep.drift||[]).length} · Stale Processes: ${(rep.stale_processes||[]).length}</div>
+    ${findings ? '<ul class="checklist">' + findings + '</ul>' : '<div class="meta">No vulnerable packages matched.</div>'}
+    ${drifts ? '<ul class="checklist">' + drifts + '</ul>' : ''}
+  `;
+  await loadSelfHeal();
+}
+
+async function runPatch(dryRun) {
+  const box = document.getElementById('patch-summary');
+  box.classList.remove('hidden');
+  box.textContent = dryRun ? 'Calculating dry-run patch plan...' : 'Applying approved security patches, drift fixes, and virtual patches...';
+  const res = await fetch('/api/v1/patch', { method: 'POST', headers: headers(), body: JSON.stringify({ dry_run: dryRun }) });
+  const s = await res.json();
+  box.innerHTML = `
+    <div><strong>Patch Cycle (${esc(s.mode)}${s.dry_run ? ' — DRY RUN' : ''})</strong></div>
+    <div class="meta mono">packages=${(s.package_results||[]).length} · service_restarts=${(s.service_restarts||[]).length} · drift_fixes=${(s.drift_fixes||[]).length} · virtual_applied=${(s.virtual_patches_applied||[]).length} · virtual_revoked=${(s.virtual_patches_revoked||[]).length}</div>
+    ${(s.virtual_patches_rejected||[]).length ? '<div class="meta">Rejected by anti-lockout: ' + esc(s.virtual_patches_rejected.join('; ')) + '</div>' : ''}
+  `;
+  await loadSelfHeal();
+  await refresh();
 }
 </script>
 </body>

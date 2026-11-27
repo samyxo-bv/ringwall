@@ -24,6 +24,9 @@ const (
 	rawEventSendto       uint32 = 4
 	rawEventIOUring      uint32 = 5
 	rawEventOpenResolved uint32 = 6
+	rawEventOpenBlocked  uint32 = 7
+	rawEventLinkDest     uint32 = 8
+	rawEventExecBlocked  uint32 = 9
 
 	rawAFInet  uint16 = 2
 	rawAFInet6 uint16 = 10
@@ -58,6 +61,13 @@ type Sensor interface {
 // OpenHookReporter is optionally implemented by sensors that expose which open hook is active.
 type OpenHookReporter interface {
 	OpenHook() string
+}
+
+// LSMController is optionally implemented by sensors supporting live synchronous eBPF LSM blocking.
+type LSMController interface {
+	LSMEnforceActive() bool
+	SetLSMEnforce(enabled bool) error
+	SyncBlockedExecPaths(paths []string) (int, error)
 }
 
 // DecodeRawEvent converts a 1344-byte eBPF ringbuf record into a model.Event.
@@ -101,6 +111,18 @@ func DecodeRawEvent(data []byte, now time.Time) (model.Event, error) {
 		ev.Type = model.EventOpen
 		ev.IsWrite = (raw.Flags & openWriteMask) != 0
 		ev.PathResolved = true
+	case rawEventOpenBlocked:
+		ev.Type = model.EventOpen
+		ev.IsWrite = (raw.Flags & openWriteMask) != 0
+		ev.PathResolved = true
+		ev.KernelBlocked = true
+	case rawEventLinkDest:
+		ev.Type = model.EventOpen
+		ev.IsWrite = (raw.Flags & openWriteMask) != 0
+		ev.ResolveParentOnly = true
+	case rawEventExecBlocked:
+		ev.Type = model.EventExec
+		ev.KernelBlocked = true
 	case rawEventConnect, rawEventSendto:
 		ev.Type = model.EventConnect
 		ev.DstPort = raw.DPort

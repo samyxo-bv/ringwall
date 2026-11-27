@@ -13,12 +13,13 @@ jobs:
   build-and-test:
     name: eBPF + Go Build & Race Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: "1.24"
+          go-version: "1.27"
 
       - name: Install eBPF build toolchain
         run: |
@@ -45,10 +46,94 @@ jobs:
       - name: Validate built-in YAML policy packs
         run: ./bin/ringwallctl policy-check ./policies
 
-      - name: Live root host integration test (eBPF + 0600 token + simulate + audit verify)
+      - name: Live root host integration test (eBPF LSM + LD_PRELOAD taint + bprm virtual-patch + audit verify)
         run: |
           TMPDIR="$(mktemp -d)"
+          chmod 0755 "${TMPDIR}"
           sudo mkdir -p "${TMPDIR}/run" "${TMPDIR}/log"
+
+          # Pre-create test fixtures BEFORE starting ringwalld so the step shell itself never opens a /.ssh/id_* path while LSM is active.
+          mkdir -p "${TMPDIR}/ldp/.ssh"
+          printf 'RINGWALL-LDP-DECOY\n' > "${TMPDIR}/ldp/.ssh/id_ed25519"
+          chmod 0600 "${TMPDIR}/ldp/.ssh/id_ed25519"
+          cat > "${TMPDIR}/ldp/evil.c" <<'CEOF'
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <pthread.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <sys/wait.h>
+          #include <unistd.h>
+          static void try_open(const char *tag) {
+              const char *p = getenv("RW_TARGET_KEY");
+              if (!p) return;
+              int fd = open(p, O_RDONLY);
+              if (fd >= 0) {
+                  close(fd);
+                  dprintf(2, "LDP_LEAKED_%s=1\n", tag);
+              } else {
+                  dprintf(2, "LDP_ERRNO_%s=%d\n", tag, errno);
+              }
+          }
+          static void *thread_fn(void *arg) {
+              (void)arg;
+              try_open("THREAD");
+              return NULL;
+          }
+          __attribute__((constructor)) static void steal(void) {
+              try_open("MAIN");
+              pthread_t th;
+              if (pthread_create(&th, NULL, thread_fn, NULL) == 0) {
+                  pthread_join(th, NULL);
+              }
+              pid_t child = fork();
+              if (child == 0) {
+                  try_open("FORK");
+                  _exit(0);
+              } else if (child > 0) {
+                  waitpid(child, NULL, 0);
+              }
+              _exit(42);
+          }
+          CEOF
+          clang -shared -fPIC -O2 -pthread "${TMPDIR}/ldp/evil.c" -o "${TMPDIR}/ldp/evil.so"
+          cat > "${TMPDIR}/ldp/ptrace_test.c" <<'PCEOF'
+          #include <signal.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <sys/ptrace.h>
+          #include <sys/wait.h>
+          #include <unistd.h>
+          int main(int argc, char **argv) {
+              if (argc < 2) return 2;
+              pid_t pid = fork();
+              if (pid == 0) {
+                  if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0) {
+                      perror("PTRACE_TRACEME");
+                      _exit(91);
+                  }
+                  raise(SIGSTOP);
+                  char *args[] = { "/usr/bin/ssh-keygen", "-y", "-f", argv[1], NULL };
+                  execv("/usr/bin/ssh-keygen", args);
+                  perror("execv");
+                  _exit(92);
+              }
+              int status = 0;
+              while (waitpid(pid, &status, 0) > 0) {
+                  if (WIFEXITED(status) || WIFSIGNALED(status)) break;
+                  if (WIFSTOPPED(status)) {
+                      ptrace(PTRACE_CONT, pid, NULL, NULL);
+                  }
+              }
+              return 0;
+          }
+          PCEOF
+          clang -O2 "${TMPDIR}/ldp/ptrace_test.c" -o "${TMPDIR}/ldp/ptrace_test"
+          cp /bin/true "${TMPDIR}/vp-target-bin"
+          chmod 0755 "${TMPDIR}/vp-target-bin"
+          cp /bin/true "${PWD}/.rw-ext4-vp-bin"
+          chmod 0755 "${PWD}/.rw-ext4-vp-bin"
+
           cat > "${TMPDIR}/ringwall.yaml" <<EOF
           mode: interactive
           policy_dirs:
@@ -56,25 +141,178 @@ jobs:
           audit_log_path: ${TMPDIR}/log/audit.jsonl
           sensor:
             mode: auto
+            enable_lsm_blocking: true
           enforcer:
             enable_signals: true
             enable_nftables: false
+          patcher:
+            virtual_patch_file: ${TMPDIR}/vpatches.json
+            ab_update:
+              enabled: false
+              state_file: ${TMPDIR}/ab-state.json
+              boot_env_file: ${TMPDIR}/ab-boot.env
           ai:
             enabled: false
           api:
             listen_addr: 127.0.0.1:19443
             token_file: ${TMPDIR}/run/api.token
           EOF
-          sudo ./bin/ringwalld -config "${TMPDIR}/ringwall.yaml" 2>"${TMPDIR}/daemon.log" &
-          DPID=$!
-          trap "cat ${TMPDIR}/daemon.log || true; sudo kill $DPID 2>/dev/null || true" EXIT
+          stop_pidfile() {
+            local pf="$1"
+            if [ -f "$pf" ]; then
+              local pid
+              pid="$(cat "$pf" 2>/dev/null || true)"
+              if [ -n "$pid" ]; then
+                sudo kill -TERM "$pid" 2>/dev/null || true
+                for _ in $(seq 1 25); do
+                  sudo kill -0 "$pid" 2>/dev/null || break
+                  sleep 0.2
+                done
+                sudo kill -KILL "$pid" 2>/dev/null || true
+              fi
+            fi
+          }
+          trap "cat ${TMPDIR}/daemon.log || true; cat ${TMPDIR}/daemon-optin.log 2>/dev/null || true; stop_pidfile ${TMPDIR}/ringwalld1.pid; stop_pidfile ${TMPDIR}/ringwalld2.pid; sudo rm -rf ${TMPDIR}; rm -f ${PWD}/.rw-ext4-vp-bin" EXIT
+          sudo bash -c "echo \$\$ > '${TMPDIR}/ringwalld1.pid'; exec ./bin/ringwalld -config '${TMPDIR}/ringwall.yaml'" 2>"${TMPDIR}/daemon.log" &
           for i in $(seq 1 20); do sudo test -f "${TMPDIR}/run/api.token" && break; sleep 0.5; done
           PERM="$(sudo stat -c '%a' "${TMPDIR}/run/api.token")"
           test "${PERM}" = "600"
-          grep -q "attached fentry/security_file_open" "${TMPDIR}/daemon.log"
+          grep -qE "attached (lsm/file_open|fentry/security_file_open)" "${TMPDIR}/daemon.log"
           sudo ./bin/ringwallctl -api http://127.0.0.1:19443 -token-file "${TMPDIR}/run/api.token" status
+          sudo ./bin/ringwallctl -api http://127.0.0.1:19443 -token-file "${TMPDIR}/run/api.token" scan
+          sudo ./bin/ringwallctl -api http://127.0.0.1:19443 -token-file "${TMPDIR}/run/api.token" patch --dry-run
           sudo ./bin/ringwallctl -api http://127.0.0.1:19443 -token-file "${TMPDIR}/run/api.token" simulate
           sudo ./bin/ringwallctl verify-log "${TMPDIR}/log/audit.jsonl"
+          ./bin/ringwallctl ab-keygen "${TMPDIR}/ab"
+          ./bin/ringwallctl ab-sign "${TMPDIR}/ab.priv" v0.2.0 https://example.com/ringwall.iso ./bin/ringwallctl "${TMPDIR}/ab-manifest.json"
+          ./bin/ringwallctl ab-verify "${TMPDIR}/ab.pub" "${TMPDIR}/ab-manifest.json" v0.1.0
+
+          if grep -q "attached lsm/file_open" "${TMPDIR}/daemon.log"; then
+            grep -q "attached lsm/mmap_file" "${TMPDIR}/daemon.log"
+            grep -q "attached lsm/ptrace_access_check" "${TMPDIR}/daemon.log"
+            grep -q "attached lsm/bprm_check_security" "${TMPDIR}/daemon.log"
+            grep -q "allowed_ssh=0" "${TMPDIR}/daemon.log"
+
+            # Live zero-exemption default proofs: ssh -F AND rogue SSH_AUTH_SOCK ssh-add BOTH blocked (-EPERM, 0 bytes leaked)!
+            /usr/bin/ssh -F "${TMPDIR}/ldp/.ssh/id_ed25519" x >"${TMPDIR}/sshf_out" 2>&1 &
+            SPID=$!
+            for _ in $(seq 1 12); do
+              [ -s "${TMPDIR}/sshf_out" ] && break
+              grep -q '(stopped)' /proc/$SPID/status 2>/dev/null && kill -CONT $SPID 2>/dev/null || true
+              sleep 0.25
+            done
+            kill -9 $SPID 2>/dev/null || true
+            wait $SPID 2>/dev/null || true
+            cat "${TMPDIR}/sshf_out"
+            grep -qiE "(Operation not permitted|Permission denied)" "${TMPDIR}/sshf_out"
+            ! grep -qi "ringwall-ldp-decoy" "${TMPDIR}/sshf_out"
+
+            # Live zero-exemption default proof #2: rogue SSH_AUTH_SOCK + ssh-add connects to rogue socket,
+            # tries to open private key -> blocked synchronously by lsm/file_open (-EPERM, 0 bytes received on socket)!
+            python3 -c 'import os, socket, sys; p=sys.argv[1]; s=socket.socket(socket.AF_UNIX); s.bind(p); s.listen(1); s.settimeout(5); c,_=s.accept(); d=c.recv(4096); open(sys.argv[2],"wb").write(d); c.close(); s.close()' "${TMPDIR}/fake.sock" "${TMPDIR}/rogue_rx.bin" &
+            RPID=$!
+            for _ in $(seq 1 20); do [ -S "${TMPDIR}/fake.sock" ] && break; sleep 0.1; done
+            SSH_AUTH_SOCK="${TMPDIR}/fake.sock" /usr/bin/ssh-add "${TMPDIR}/ldp/.ssh/id_ed25519" >"${TMPDIR}/sshadd_out" 2>&1 &
+            APID=$!
+            for _ in $(seq 1 12); do
+              [ -s "${TMPDIR}/sshadd_out" ] && break
+              grep -q '(stopped)' /proc/$APID/status 2>/dev/null && kill -CONT $APID 2>/dev/null || true
+              sleep 0.25
+            done
+            kill -9 $APID $RPID 2>/dev/null || true
+            wait $APID $RPID 2>/dev/null || true
+            cat "${TMPDIR}/sshadd_out"
+            grep -qi "Operation not permitted" "${TMPDIR}/sshadd_out"
+            test ! -s "${TMPDIR}/rogue_rx.bin"
+
+            # Verify FS_IOC_GETVERSION succeeds on ${PWD} (ext4) before testing lsm/bprm_check_security on both tmpfs & ext4!
+            python3 -c 'import array, fcntl, os, sys; fd=os.open(sys.argv[1], os.O_RDONLY); buf=array.array("i",[0]); fcntl.ioctl(fd, 0x80087601, buf); os.close(fd); print("EXT4_IGENERATION=", buf[0])' "${PWD}/.rw-ext4-vp-bin"
+
+            # Live lsm/bprm_check_security proof (both tmpfs AND ext4 with FS_IOC_GETVERSION i_generation):
+            TOKEN="$(sudo cat "${TMPDIR}/run/api.token")"
+            "${TMPDIR}/vp-target-bin"
+            "${PWD}/.rw-ext4-vp-bin"
+            curl -fsS -X POST -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json" \
+              -d "{\"id\":\"VP-LIVE-TEST\",\"cve\":\"CVE-2099-9999\",\"package\":\"vp-test\",\"target_exe_paths\":[\"${TMPDIR}/vp-target-bin\",\"${PWD}/.rw-ext4-vp-bin\"],\"action\":\"freeze\",\"source\":\"operator\",\"rationale\":\"live CI LSM bprm verification\"}" \
+              http://127.0.0.1:19443/api/v1/virtual-patches
+            for BIN in "${TMPDIR}/vp-target-bin" "${PWD}/.rw-ext4-vp-bin"; do
+              rm -f "${TMPDIR}/vp_out"
+              python3 -c 'import os, sys; exec("try:\n os.execv(sys.argv[1], [sys.argv[1]])\nexcept OSError as e:\n print(\"VP_EXEC_ERRNO=\" + str(e.errno), flush=True)")' "${BIN}" >"${TMPDIR}/vp_out" 2>&1 &
+              VPID=$!
+              for _ in $(seq 1 12); do
+                [ -s "${TMPDIR}/vp_out" ] && break
+                grep -q '(stopped)' /proc/$VPID/status 2>/dev/null && kill -CONT $VPID 2>/dev/null || true
+                sleep 0.25
+              done
+              kill -9 $VPID 2>/dev/null || true
+              wait $VPID 2>/dev/null || true
+              cat "${TMPDIR}/vp_out"
+              grep -q "VP_EXEC_ERRNO=1" "${TMPDIR}/vp_out"
+            done
+            curl -fsS -X DELETE -H "Authorization: Bearer ${TOKEN}" \
+              http://127.0.0.1:19443/api/v1/virtual-patches/VP-LIVE-TEST
+            "${TMPDIR}/vp-target-bin"
+            "${PWD}/.rw-ext4-vp-bin"
+
+            # Stop default zero-exemption daemon completely (verifying its exact PID exited & detached eBPF LSM),
+            # then verify opt-in allowlisted /usr/bin/ssh-keygen controls:
+            # (1) positive control: untraced/untainted ssh-keygen CAN open decoy key (prints invalid format, NOT EPERM),
+            # (2) LD_PRELOAD main+pthread+fork is blocked at ld.so map time by lsm/mmap_file,
+            # (3) pre-exec PTRACE_TRACEME revokes exemption via task->ptrace != 0 -> EPERM!
+            stop_pidfile "${TMPDIR}/ringwalld1.pid"
+            mkdir -p "${TMPDIR}/optin-policies"
+            cp "${PWD}"/policies/*.yaml "${TMPDIR}/optin-policies/"
+            python3 -c 'import sys; p=sys.argv[1]; s=open(p).read(); s=s.replace("        - '\''**/.ssh/*.pub'\''", "        - '\''**/.ssh/*.pub'\''\n      exclude_exe_paths:\n        - '\''/usr/bin/ssh-keygen'\''", 1); open(p,"w").write(s)' "${TMPDIR}/optin-policies/10-ai-agent-guard.yaml"
+            cat > "${TMPDIR}/ringwall-optin.yaml" <<EOF
+          mode: interactive
+          policy_dirs:
+            - ${TMPDIR}/optin-policies
+          audit_log_path: ${TMPDIR}/log/audit-optin.jsonl
+          sensor:
+            mode: auto
+            enable_lsm_blocking: true
+            lsm_allowed_ssh_exes:
+              - /usr/bin/ssh-keygen
+          enforcer:
+            enable_signals: true
+            enable_nftables: false
+          patcher:
+            virtual_patch_file: ${TMPDIR}/vpatches-optin.json
+            ab_update:
+              enabled: false
+          ai:
+            enabled: false
+          api:
+            listen_addr: 127.0.0.1:19444
+            token_file: ${TMPDIR}/run/api-optin.token
+          EOF
+            sudo bash -c "echo \$\$ > '${TMPDIR}/ringwalld2.pid'; exec ./bin/ringwalld -config '${TMPDIR}/ringwall-optin.yaml'" 2>"${TMPDIR}/daemon-optin.log" &
+            for i in $(seq 1 20); do sudo test -f "${TMPDIR}/run/api-optin.token" && break; sleep 0.5; done
+            grep -q "allowed_ssh=1" "${TMPDIR}/daemon-optin.log"
+
+            # Positive control (P2-g): untraced opt-in ssh-keygen opens decoy key (reaches key parser -> invalid format / error in libcrypto, NOT EPERM):
+            POS_OUT="$(timeout 10 /usr/bin/ssh-keygen -y -f "${TMPDIR}/ldp/.ssh/id_ed25519" </dev/null 2>&1 || true)"
+            echo "POSITIVE_CONTROL: ${POS_OUT}"
+            echo "${POS_OUT}" | grep -qiE "(invalid format|error in libcrypto)"
+            ! echo "${POS_OUT}" | grep -qi "Operation not permitted"
+
+            # Live P1-A proof on opt-in ssh-keygen: LD_PRELOAD blocked at ld.so map time (main/pthread/fork never run):
+            timeout 10 env "RW_TARGET_KEY=${TMPDIR}/ldp/.ssh/id_ed25519" "LD_PRELOAD=${TMPDIR}/ldp/evil.so" /usr/bin/ssh-keygen -l -f /dev/null >"${TMPDIR}/ldp_out" 2>&1 || true
+            cat "${TMPDIR}/ldp_out"
+            grep -qE "(failed to map segment|Operation not permitted|cannot be preloaded)" "${TMPDIR}/ldp_out"
+            ! grep -q "LDP_LEAKED" "${TMPDIR}/ldp_out"
+            ! grep -q "LDP_ERRNO" "${TMPDIR}/ldp_out"
+            /usr/bin/ssh-keygen -t ed25519 -N "" -f "${TMPDIR}/legit_key" >/dev/null
+            test -f "${TMPDIR}/legit_key.pub"
+
+            # Live P2-1 proof (with positive control above!): pre-exec PTRACE_TRACEME revokes ssh-keygen exemption -> EPERM!
+            timeout 10 "${TMPDIR}/ldp/ptrace_test" "${TMPDIR}/ldp/.ssh/id_ed25519" >"${TMPDIR}/pt_out" 2>&1 || true
+            cat "${TMPDIR}/pt_out"
+            grep -qi "Operation not permitted" "${TMPDIR}/pt_out"
+            ! grep -qi "invalid format" "${TMPDIR}/pt_out"
+            stop_pidfile "${TMPDIR}/ringwalld2.pid"
+            echo "LIVE_LSM_ZERO_EXEMPT_OPTIN_PTRACE_MMAP_AND_BPRM_PROOFS_OK"
+          fi
 
       - name: Upload compiled Linux binaries
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -88,6 +326,7 @@ jobs:
   build-and-verify-iso:
     name: Build Immutable ISO & Live QEMU Attack E2E
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: build-and-test
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -118,7 +357,7 @@ jobs:
       - name: Build hardened immutable bootable ISO
         run: sudo ./iso/build-iso.sh --out dist/ringwall-appliance-amd64.iso
 
-      - name: Boot ISO in QEMU & verify 14 live security assertions
+      - name: Boot ISO in QEMU & verify 16 live LSM + self-healing security assertions
         run: ./iso/test-qemu.sh dist/ringwall-appliance-amd64.iso
 
       - name: Upload verified bootable ISO

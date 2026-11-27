@@ -27,12 +27,44 @@ type Config struct {
 	Enforcer     EnforcerConfig `yaml:"enforcer"`
 	AI           AIConfig       `yaml:"ai"`
 	API          APIConfig      `yaml:"api"`
+	Scanner      ScannerConfig  `yaml:"scanner"`
+	Patcher      PatcherConfig  `yaml:"patcher"`
 }
 
 type SensorConfig struct {
-	Mode           string `yaml:"mode"` // auto | ebpf | procfs | none
-	BPFObjectPath  string `yaml:"bpf_object_path"`
-	PollIntervalMS int    `yaml:"poll_interval_ms"`
+	Mode              string   `yaml:"mode"` // auto | ebpf | procfs | none
+	BPFObjectPath     string   `yaml:"bpf_object_path"`
+	PollIntervalMS    int      `yaml:"poll_interval_ms"`
+	EnableLSMBlocking bool     `yaml:"enable_lsm_blocking"`
+	LSMAllowedSSHExes []string `yaml:"lsm_allowed_ssh_exes,omitempty"` // default empty [] (zero exemptions); opt-in host SSH binaries explicitly
+}
+
+type ScannerConfig struct {
+	Enabled          bool   `yaml:"enabled" json:"enabled"`
+	IntervalMin      int    `yaml:"interval_min" json:"interval_min"`
+	AllowOnlineFeeds bool   `yaml:"allow_online_feeds" json:"allow_online_feeds"`
+	OSVBaseURL       string `yaml:"osv_base_url,omitempty" json:"osv_base_url,omitempty"`
+	CISAKEVURL       string `yaml:"cisa_kev_url,omitempty" json:"cisa_kev_url,omitempty"`
+	OfflineDBPath    string `yaml:"offline_db_path,omitempty" json:"offline_db_path,omitempty"`
+}
+
+type ABUpdateConfig struct {
+	Enabled               bool   `yaml:"enabled" json:"enabled"`
+	TrustedPubKeyEd25519  string `yaml:"trusted_pubkey_ed25519_b64,omitempty" json:"trusted_pubkey_ed25519_b64,omitempty"`
+	StatePath             string `yaml:"state_path,omitempty" json:"state_path,omitempty"`
+	BootEnvPath           string `yaml:"boot_env_path,omitempty" json:"boot_env_path,omitempty"`
+	SlotAPath             string `yaml:"slot_a_path,omitempty" json:"slot_a_path,omitempty"`
+	SlotBPath             string `yaml:"slot_b_path,omitempty" json:"slot_b_path,omitempty"`
+}
+
+type PatcherConfig struct {
+	Mode                 string         `yaml:"mode" json:"mode"` // off | virtual_only | auto_critical | auto_all
+	DryRun               bool           `yaml:"dry_run" json:"dry_run"`
+	AutoFixDrift         bool           `yaml:"auto_fix_drift" json:"auto_fix_drift"`
+	RestartStaleServices bool           `yaml:"restart_stale_services" json:"restart_stale_services"`
+	AIVirtualPatch       bool           `yaml:"ai_virtual_patch" json:"ai_virtual_patch"`
+	VirtualPatchFile     string         `yaml:"virtual_patch_file,omitempty" json:"virtual_patch_file,omitempty"`
+	ABUpdate             ABUpdateConfig `yaml:"ab_update" json:"ab_update"`
 }
 
 type EnforcerConfig struct {
@@ -96,9 +128,10 @@ func Default() *Config {
 		PolicyDirs:   []string{"/etc/ringwall/policies.d"},
 		AuditLogPath: "/var/log/ringwall/audit.jsonl",
 		Sensor: SensorConfig{
-			Mode:           "auto",
-			BPFObjectPath:  "/usr/lib/ringwall/ringwall.bpf.o",
-			PollIntervalMS: 250,
+			Mode:              "auto",
+			BPFObjectPath:     "/usr/lib/ringwall/ringwall.bpf.o",
+			PollIntervalMS:    250,
+			EnableLSMBlocking: true,
 		},
 		Enforcer: EnforcerConfig{
 			EnableSignals:  true,
@@ -126,6 +159,24 @@ func Default() *Config {
 			ListenAddr:       "127.0.0.1:9443",
 			TokenFile:        "/run/ringwall/api.token",
 			AllowNonLoopback: false,
+		},
+		Scanner: ScannerConfig{
+			Enabled:          true,
+			IntervalMin:      60,
+			AllowOnlineFeeds: false,
+		},
+		Patcher: PatcherConfig{
+			Mode:                 "virtual_only",
+			DryRun:               false,
+			AutoFixDrift:         true,
+			RestartStaleServices: true,
+			AIVirtualPatch:       true,
+			VirtualPatchFile:     "/var/lib/ringwall/virtual-patches.json",
+			ABUpdate: ABUpdateConfig{
+				Enabled:     false,
+				StatePath:   "/var/lib/ringwall/ab-state.json",
+				BootEnvPath: "/var/lib/ringwall/ab-boot.env",
+			},
 		},
 	}
 }
@@ -281,6 +332,18 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("ai.models[%d]: %w", i, err)
 			}
 		}
+	}
+
+	if c.Scanner.IntervalMin <= 0 {
+		c.Scanner.IntervalMin = 60
+	}
+	if c.Patcher.Mode == "" {
+		c.Patcher.Mode = "virtual_only"
+	}
+	switch c.Patcher.Mode {
+	case "off", "virtual_only", "auto_critical", "auto_all":
+	default:
+		return fmt.Errorf("invalid patcher.mode %q (expected off, virtual_only, auto_critical, or auto_all)", c.Patcher.Mode)
 	}
 
 	return nil

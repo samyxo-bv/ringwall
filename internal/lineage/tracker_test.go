@@ -140,6 +140,32 @@ func TestTrackerDoesNotOverwriteKernelResolvedPathOnSymlinkSwap(t *testing.T) {
 	}
 }
 
+func TestTrackerResolveParentOnlyPreservesSymlinkDestinationName(t *testing.T) {
+	// Simulates os.symlink('/tmp/evil', '/tmp/d/authorized_keys') where /tmp/d -> /home/alice/.ssh
+	// and authorized_keys is now itself a symlink pointing to /tmp/evil after the syscall completes.
+	fr := &fakeProcReader{
+		procs: map[int]model.ProcessInfo{
+			301: {PID: 301, PPID: 1, StartTime: 1000, Comm: "python3", Exe: "/usr/bin/python3", Cwd: "/"},
+		},
+		symlinks: map[string]string{
+			"/tmp/d":                         "/home/alice/.ssh",
+			"/home/alice/.ssh/authorized_keys": "/tmp/evil",
+		},
+	}
+	tr := NewTracker(fr)
+	ev := model.Event{
+		Type:              model.EventOpen,
+		PID:               301,
+		Path:              "/tmp/d/authorized_keys",
+		IsWrite:           true,
+		ResolveParentOnly: true,
+	}
+	tr.Enrich(&ev)
+	if ev.Path != "/home/alice/.ssh/authorized_keys" {
+		t.Fatalf("expected parent resolved while keeping leaf authorized_keys, got %q", ev.Path)
+	}
+}
+
 func TestTrackerConcurrentEnrichAndCycleSafe(t *testing.T) {
 	fr := &fakeProcReader{
 		procs: map[int]model.ProcessInfo{
