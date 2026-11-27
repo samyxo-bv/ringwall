@@ -98,34 +98,32 @@ func fileKeysForPath(p string) []bpfFileKey {
 	return keys
 }
 
-// regularFileKeysNoFollow opens p with O_NOFOLLOW|O_CLOEXEC (refusing final-component symlinks),
-// Fstats the exact opened inode verifying S_IFREG, and reads FS_IOC_GETVERSION (i_generation) on
-// persistent filesystems (ext4/xfs/btrfs) so reused inode numbers never falsely block newer binaries (P1-1).
+// regularFileKeysNoFollow opens p with O_PATH|O_NOFOLLOW|O_CLOEXEC first (refusing final-component
+// symlinks and never blocking on FIFOs/devices, P2-e), Fstats the exact opened inode verifying
+// S_IFREG, and only then reopens /proc/self/fd/<fd> with O_RDONLY|O_NONBLOCK|O_NOCTTY|O_CLOEXEC to
+// read FS_IOC_GETVERSION (i_generation) on ext4/xfs/btrfs (P1-1).
 func regularFileKeysNoFollow(p string) ([]bpfFileKey, bpfExecDenyVal) {
 	var denyVal bpfExecDenyVal
-	fd, err := unix.Open(p, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-	readable := err == nil
+	pathFD, err := unix.Open(p, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		fd, err = unix.Open(p, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-		if err != nil {
-			return nil, denyVal
-		}
+		return nil, denyVal
 	}
-	defer unix.Close(fd)
+	defer unix.Close(pathFD)
 
 	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
+	if err := unix.Fstat(pathFD, &st); err != nil {
 		return nil, denyVal
 	}
 	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Ino == 0 {
 		return nil, denyVal
 	}
-	if readable {
+	if readFD, rerr := unix.Open(fmt.Sprintf("/proc/self/fd/%d", pathFD), unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOCTTY|unix.O_CLOEXEC, 0); rerr == nil {
 		// Linux FS_IOC_GETVERSION = _IOR('v', 1, long) (0x80087601 on 64-bit, 0x80047601 on 32-bit).
 		fsIOCGetVersion := uint(0x80007601) | (uint(unsafe.Sizeof(uintptr(0))) << 16)
-		if gen, gerr := unix.IoctlGetInt(fd, fsIOCGetVersion); gerr == nil {
+		if gen, gerr := unix.IoctlGetInt(readFD, fsIOCGetVersion); gerr == nil {
 			denyVal = bpfExecDenyVal{HasGen: 1, Gen: uint32(gen)}
 		}
+		_ = unix.Close(readFD)
 	}
 	toKernelDev := func(rawDev uint64) uint32 {
 		return uint32((unix.Major(rawDev) << 20) | (unix.Minor(rawDev) & 0xfffff))
@@ -145,22 +143,15 @@ func regularFileKeysNoFollow(p string) ([]bpfFileKey, bpfExecDenyVal) {
 }
 
 func populateAllowedSSHExes(m *ebpf.Map, configured []string) int {
-	if m == nil {
+	if m == nil || len(configured) == 0 {
 		return 0
 	}
-	// Default omits /usr/bin/ssh (defeats GTFOBins `ssh -F ~/.ssh/id_ed25519 x` key leak, P1-2).
-	// Operators can opt into direct ssh or pass an empty slice [] for zero exemptions via sensor.lsm_allowed_ssh_exes.
-	candidates := configured
-	if candidates == nil {
-		candidates = []string{
-			"/usr/bin/ssh-agent",
-			"/usr/bin/ssh-add",
-			"/usr/bin/ssh-keygen",
-		}
-	}
+	// Fail-closed zero-exemption default (empty list): defeats ssh -F, SSH_AUTH_SOCK ssh-add,
+	// and ssh-keygen same-UID LOLBin key leaks. Host operators explicitly opt into binaries via
+	// sensor.lsm_allowed_ssh_exes in ringwall.yaml.
 	val := uint32(1)
 	added := 0
-	for _, p := range candidates {
+	for _, p := range configured {
 		for _, k := range fileKeysForPath(p) {
 			if err := m.Put(&k, &val); err == nil {
 				added++

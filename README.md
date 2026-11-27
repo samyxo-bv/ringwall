@@ -84,6 +84,8 @@ sudo ringwallctl verify-log
 
 Open the local web UI at `http://127.0.0.1:9443` using the root-only bearer token from `sudo cat /run/ringwall/api.token`.
 
+> **Host SSH key workflow (zero-exemption default):** By default, Ringwall blocks *all* direct on-disk SSH private-key opens (`sensor.lsm_allowed_ssh_exes: []`) to prevent same-UID `ssh -F` and rogue `SSH_AUTH_SOCK` `ssh-add` exfiltration. For interactive host SSH, prefer FIDO2/hardware keys, or explicitly opt your local binaries (with passphrase-protected keys) into `sensor.lsm_allowed_ssh_exes` in `/etc/ringwall/ringwall.yaml` and `exclude_exe_paths` in `/etc/ringwall/policies.d/10-ai-agent-guard.yaml`.
+
 ---
 
 ## Bootable Immutable Hardened ISO (with Synchronous eBPF LSM)
@@ -98,7 +100,7 @@ Ringwall ships an automated **hybrid BIOS + UEFI bootable Linux appliance ISO** 
 
 ### Live QEMU & Host Verification (16 Live ISO + Host LSM Assertions on Every CI & Release Run)
 
-Every CI run verifies `lsm/mmap_file` (`LD_PRELOAD` main/pthread/fork into `/usr/bin/ssh-keygen` blocked at `ld.so` map time while normal `ssh-keygen` works), `ssh -F` GTFOBins key-leak blocking (`-EPERM`), pre-exec `PTRACE_TRACEME` (`task->ptrace != 0`) exemption revocation, and `lsm/bprm_check_security` (live tmpfs + ext4 `i_generation` virtual-patch block & revoke) on the Linux host, AND boots the freshly built `.iso` headless in QEMU as unprivileged `operator` to prove live inside the VM:
+Every CI run verifies **zero-exemption default blocking** (`ssh -F` and rogue `SSH_AUTH_SOCK` `ssh-add` -> `-EPERM`), **opt-in `ssh-keygen` positive control + `lsm/mmap_file` (`LD_PRELOAD` main/pthread/fork blocked at `ld.so` map time) + pre-exec `PTRACE_TRACEME` (`task->ptrace != 0` -> `-EPERM`)**, and `lsm/bprm_check_security` (live `tmpfs` + verified `ext4` `FS_IOC_GETVERSION` `i_generation` virtual-patch block & revoke) on the Linux host, AND boots the freshly built `.iso` headless in QEMU as unprivileged `operator` to prove live inside the VM:
 1. Read-only SquashFS + no `sshd`; `open_hook: lsm/file_open`, `lsm_enforce_active: true`, and `ringwall.slot=A`.
 2. Monitored `operator` cannot read `/run/ringwall/api.token` or `/var/log/ringwall/audit.jsonl` and gets HTTP `401`.
 3. Direct SSH key read, `/usr/../home` traversal, `//home` traversal, **hardlinks (preexisting + new)**, **spoofed `/tmp/ssh` copies**, directory symlinks, cwd-relative opens, non-`/home` dot-paths (`/tmp/alt/.ssh/id_ed25519`), and **reads during a live UDP ringbuf-saturation flood** are **ALL blocked synchronously by the kernel with `EPERM` (0 bytes leaked)**.

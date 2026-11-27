@@ -173,21 +173,12 @@ jobs:
           ./bin/ringwallctl ab-verify "${TMPDIR}/ab.pub" "${TMPDIR}/ab-manifest.json" v0.1.0
 
           if grep -q "attached lsm/file_open" "${TMPDIR}/daemon.log"; then
-            # Live P1-A proof: lsm/mmap_file directly returns -EPERM on non-root LD_PRELOAD into
-            # allowlisted /usr/bin/ssh-keygen so main, pthread, AND fork() constructors NEVER execute!
             grep -q "attached lsm/mmap_file" "${TMPDIR}/daemon.log"
             grep -q "attached lsm/ptrace_access_check" "${TMPDIR}/daemon.log"
             grep -q "attached lsm/bprm_check_security" "${TMPDIR}/daemon.log"
-            RW_TARGET_KEY="${TMPDIR}/ldp/.ssh/id_ed25519" LD_PRELOAD="${TMPDIR}/ldp/evil.so" /usr/bin/ssh-keygen -l -f /dev/null >"${TMPDIR}/ldp_out" 2>&1 || true
-            cat "${TMPDIR}/ldp_out"
-            grep -qE "(failed to map segment|Operation not permitted|cannot be preloaded)" "${TMPDIR}/ldp_out"
-            ! grep -q "LDP_LEAKED" "${TMPDIR}/ldp_out"
-            ! grep -q "LDP_ERRNO" "${TMPDIR}/ldp_out"
-            # Verify legitimate ssh-keygen (no untrusted LD_PRELOAD) still works normally:
-            /usr/bin/ssh-keygen -t ed25519 -N "" -f "${TMPDIR}/legit_key" >/dev/null
-            test -f "${TMPDIR}/legit_key.pub"
+            grep -q "allowed_ssh=0" "${TMPDIR}/daemon.log"
 
-            # Live P1-2 proof: ssh -F <private_key> GTFOBins leak is synchronously blocked (-EPERM, 0 bytes leaked)!
+            # Live zero-exemption default proofs: ssh -F AND rogue SSH_AUTH_SOCK ssh-add BOTH blocked (-EPERM, 0 bytes leaked)!
             /usr/bin/ssh -F "${TMPDIR}/ldp/.ssh/id_ed25519" x >"${TMPDIR}/sshf_out" 2>&1 &
             SPID=$!
             for _ in $(seq 1 12); do
@@ -201,11 +192,26 @@ jobs:
             grep -qiE "(Operation not permitted|Permission denied)" "${TMPDIR}/sshf_out"
             ! grep -qi "ringwall-ldp-decoy" "${TMPDIR}/sshf_out"
 
-            # Live P2-1 proof: pre-exec PTRACE_TRACEME revokes allowlisted ssh-keygen exemption via task->ptrace != 0!
-            timeout 10 "${TMPDIR}/ldp/ptrace_test" "${TMPDIR}/ldp/.ssh/id_ed25519" >"${TMPDIR}/pt_out" 2>&1 || true
-            cat "${TMPDIR}/pt_out"
-            grep -qiE "(Operation not permitted|Permission denied)" "${TMPDIR}/pt_out"
-            ! grep -qi "ringwall-ldp-decoy" "${TMPDIR}/pt_out"
+            # Live zero-exemption default proof #2: rogue SSH_AUTH_SOCK + ssh-add connects to rogue socket,
+            # tries to open private key -> blocked synchronously by lsm/file_open (-EPERM, 0 bytes received on socket)!
+            python3 -c 'import os, socket, sys; p=sys.argv[1]; s=socket.socket(socket.AF_UNIX); s.bind(p); s.listen(1); s.settimeout(5); c,_=s.accept(); d=c.recv(4096); open(sys.argv[2],"wb").write(d); c.close(); s.close()' "${TMPDIR}/fake.sock" "${TMPDIR}/rogue_rx.bin" &
+            RPID=$!
+            for _ in $(seq 1 20); do [ -S "${TMPDIR}/fake.sock" ] && break; sleep 0.1; done
+            SSH_AUTH_SOCK="${TMPDIR}/fake.sock" /usr/bin/ssh-add "${TMPDIR}/ldp/.ssh/id_ed25519" >"${TMPDIR}/sshadd_out" 2>&1 &
+            APID=$!
+            for _ in $(seq 1 12); do
+              [ -s "${TMPDIR}/sshadd_out" ] && break
+              grep -q '(stopped)' /proc/$APID/status 2>/dev/null && kill -CONT $APID 2>/dev/null || true
+              sleep 0.25
+            done
+            kill -9 $APID $RPID 2>/dev/null || true
+            wait $APID $RPID 2>/dev/null || true
+            cat "${TMPDIR}/sshadd_out"
+            grep -qi "Operation not permitted" "${TMPDIR}/sshadd_out"
+            test ! -s "${TMPDIR}/rogue_rx.bin"
+
+            # Verify FS_IOC_GETVERSION succeeds on ${PWD} (ext4) before testing lsm/bprm_check_security on both tmpfs & ext4!
+            python3 -c 'import array, fcntl, os, sys; fd=os.open(sys.argv[1], os.O_RDONLY); buf=array.array("i",[0]); fcntl.ioctl(fd, 0x80087601, buf); os.close(fd); print("EXT4_IGENERATION=", buf[0])' "${PWD}/.rw-ext4-vp-bin"
 
             # Live lsm/bprm_check_security proof (both tmpfs AND ext4 with FS_IOC_GETVERSION i_generation):
             TOKEN="$(sudo cat "${TMPDIR}/run/api.token")"
@@ -232,7 +238,65 @@ jobs:
               http://127.0.0.1:19443/api/v1/virtual-patches/VP-LIVE-TEST
             "${TMPDIR}/vp-target-bin"
             "${PWD}/.rw-ext4-vp-bin"
-            echo "LIVE_LSM_MMAP_PTRACE_SSHF_AND_BPRM_PROOFS_OK"
+
+            # Stop default zero-exemption daemon, then verify opt-in allowlisted /usr/bin/ssh-keygen controls:
+            # (1) positive control: untraced/untainted ssh-keygen CAN open decoy key (prints invalid format, NOT EPERM),
+            # (2) LD_PRELOAD main+pthread+fork is blocked at ld.so map time by lsm/mmap_file,
+            # (3) pre-exec PTRACE_TRACEME revokes exemption via task->ptrace != 0 -> EPERM!
+            sudo kill $DPID 2>/dev/null || true
+            sleep 0.5
+            mkdir -p "${TMPDIR}/optin-policies"
+            cp "${PWD}"/policies/*.yaml "${TMPDIR}/optin-policies/"
+            python3 -c 'import sys; p=sys.argv[1]; s=open(p).read(); s=s.replace("        - '\''**/.ssh/*.pub'\''", "        - '\''**/.ssh/*.pub'\''\n      exclude_exe_paths:\n        - '\''/usr/bin/ssh-keygen'\''", 1); open(p,"w").write(s)' "${TMPDIR}/optin-policies/10-ai-agent-guard.yaml"
+            cat > "${TMPDIR}/ringwall-optin.yaml" <<EOF
+          mode: interactive
+          policy_dirs:
+            - ${TMPDIR}/optin-policies
+          audit_log_path: ${TMPDIR}/log/audit-optin.jsonl
+          sensor:
+            mode: auto
+            enable_lsm_blocking: true
+            lsm_allowed_ssh_exes:
+              - /usr/bin/ssh-keygen
+          enforcer:
+            enable_signals: true
+            enable_nftables: false
+          patcher:
+            virtual_patch_file: ${TMPDIR}/vpatches-optin.json
+            ab_update:
+              enabled: false
+          ai:
+            enabled: false
+          api:
+            listen_addr: 127.0.0.1:19444
+            token_file: ${TMPDIR}/run/api-optin.token
+          EOF
+            sudo ./bin/ringwalld -config "${TMPDIR}/ringwall-optin.yaml" 2>"${TMPDIR}/daemon-optin.log" &
+            DPID=$!
+            for i in $(seq 1 20); do sudo test -f "${TMPDIR}/run/api-optin.token" && break; sleep 0.5; done
+            grep -q "allowed_ssh=1" "${TMPDIR}/daemon-optin.log"
+
+            # Positive control (P2-g): untraced opt-in ssh-keygen opens decoy key (reaches key parser -> invalid format, NOT EPERM):
+            POS_OUT="$(/usr/bin/ssh-keygen -y -f "${TMPDIR}/ldp/.ssh/id_ed25519" </dev/null 2>&1 || true)"
+            echo "POSITIVE_CONTROL: ${POS_OUT}"
+            echo "${POS_OUT}" | grep -qi "invalid format"
+            ! echo "${POS_OUT}" | grep -qi "Operation not permitted"
+
+            # Live P1-A proof on opt-in ssh-keygen: LD_PRELOAD blocked at ld.so map time (main/pthread/fork never run):
+            RW_TARGET_KEY="${TMPDIR}/ldp/.ssh/id_ed25519" LD_PRELOAD="${TMPDIR}/ldp/evil.so" /usr/bin/ssh-keygen -l -f /dev/null >"${TMPDIR}/ldp_out" 2>&1 || true
+            cat "${TMPDIR}/ldp_out"
+            grep -qE "(failed to map segment|Operation not permitted|cannot be preloaded)" "${TMPDIR}/ldp_out"
+            ! grep -q "LDP_LEAKED" "${TMPDIR}/ldp_out"
+            ! grep -q "LDP_ERRNO" "${TMPDIR}/ldp_out"
+            /usr/bin/ssh-keygen -t ed25519 -N "" -f "${TMPDIR}/legit_key" >/dev/null
+            test -f "${TMPDIR}/legit_key.pub"
+
+            # Live P2-1 proof (with positive control above!): pre-exec PTRACE_TRACEME revokes ssh-keygen exemption -> EPERM!
+            timeout 10 "${TMPDIR}/ldp/ptrace_test" "${TMPDIR}/ldp/.ssh/id_ed25519" >"${TMPDIR}/pt_out" 2>&1 || true
+            cat "${TMPDIR}/pt_out"
+            grep -qi "Operation not permitted" "${TMPDIR}/pt_out"
+            ! grep -qi "invalid format" "${TMPDIR}/pt_out"
+            echo "LIVE_LSM_ZERO_EXEMPT_OPTIN_PTRACE_MMAP_AND_BPRM_PROOFS_OK"
           fi
 
       - name: Upload compiled Linux binaries

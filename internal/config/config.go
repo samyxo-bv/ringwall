@@ -36,7 +36,7 @@ type SensorConfig struct {
 	BPFObjectPath     string   `yaml:"bpf_object_path"`
 	PollIntervalMS    int      `yaml:"poll_interval_ms"`
 	EnableLSMBlocking bool     `yaml:"enable_lsm_blocking"`
-	LSMAllowedSSHExes []string `yaml:"lsm_allowed_ssh_exes,omitempty"` // nil = default [ssh-agent, ssh-add, ssh-keygen]; [] = zero exemptions
+	LSMAllowedSSHExes []string `yaml:"lsm_allowed_ssh_exes,omitempty"` // default empty [] (zero exemptions); opt-in host SSH binaries explicitly
 }
 
 type ScannerConfig struct {
